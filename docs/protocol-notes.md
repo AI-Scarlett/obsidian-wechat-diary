@@ -245,18 +245,58 @@ def _is_token_fresh(info, max_hours=20):
 叠加另一个更蠢的问题：每天固定同一时钟提醒，间隔接近 24 小时，
 **必然大于任何合理的窗口值**。越规律越发不出去。
 
-### 3.4 修复方向
+### 3.4 🔑 官方源码给出了决定性答案：根本没有"新鲜度"这个概念 ✅
 
-1. **删掉 `_is_token_fresh` 的时间预判，改成「到点就发、按返回码分流并记录」。**
-   现在是"我猜发不出去所以不发"——连试都不试。这不是为了测出真实窗口
-   （单用户每天一条，两周十几个聚集数据点，统计上测不出干净边界），
-   而是**不再白白放弃可能能发出去的时段**。
-2. 触发时机按「距上次互动的时长」而非时钟时间。
-3. ⚠️ **一条被误传的候选解法**：网上说"不带 context_token 降级发送"已被实测无效——
-   **核查发现这是假的**：那个被引为证据的失败日志里，失败的是"富文本降级成纯文本"的重试，
-   **仍然带着陈旧 token**，真正的 tokenless 分支从未被触发过。
-   **所以这个方案是「从未被验证」，不是「已验证无效」。值得自己实测一次。**
-4. 真正的解法是多路冗余，见 `00-decisions.md` D3。
+2026-08-05 补充核实，直接读官方 `src/messaging/inbound.ts`：
+
+```ts
+/**
+ * contextToken is issued per-message by the Weixin getupdates API and must
+ * be echoed verbatim in every outbound send. The in-memory map is the primary
+ * lookup; a disk-backed file per account ensures tokens survive gateway restarts.
+ */
+const contextTokenStore = new Map<string, string>();   // ← 就是个纯 Map
+```
+
+**这个 store 里没有时间戳、没有 TTL、没有过期逻辑、没有任何 `Date.now()`。**
+（对整个文件 grep `ttl|expire|stale|maxAge|Date.now()` —— **命中数为 0**。）
+
+而且它被**特意持久化到磁盘**，注释写明目的是
+"ensures tokens survive gateway **restarts**" —— 官方不但不丢弃旧 token，
+还专门保证它跨重启存活。
+
+**没有 token 时官方怎么做？照发。** `src/channel.ts:123`：
+```ts
+if (!params.contextToken) {
+  aLog.warn(`sendWeixinOutbound: contextToken missing for to=${params.to}, sending without context`);
+}
+// ← 只是 warn, 然后继续往下发, 没有 return
+```
+
+**官方明确支持定时投递给微信用户。** `src/channel.ts:201` 的提示词原文：
+> "When creating a **cron job (scheduled task)** for the current Weixin user, you MUST set
+> `delivery.to` to the user's Weixin ID ... `delivery: { mode: 'announce', channel: 'openclaw-weixin', ... }`"
+
+—— 定时主动推送是官方设计里的**正常用例**，不是被禁止的东西。
+
+### 3.5 结论与修复
+
+**019 的 `_is_token_fresh` 是一个官方实现里完全不存在的发明，
+而它正是那个"连试都不试就跳过提醒"的开关。**
+
+修复优先级：
+
+1. 🔴 **直接删掉 `_is_token_fresh` 和 `send_to_user` 里的预判分支。**
+   官方的策略是「有什么 token 就用什么，没有也发，失败了再按返回码处理」。
+   019 的策略是「我猜它过期了所以我不发」——**这一条改动可能就把提醒修好了。**
+2. token 存储改成跟官方一样：无 TTL、落盘、跨重启存活。
+   （019 已经落盘了，只是多了个没必要的时间判断。）
+3. 发送失败按返回码分流并记录，攒真实数据。
+4. 多路冗余仍然要做（见 `00-decisions.md` D3）——但优先级排在上面三条之后了。
+
+> 关于"不带 context_token 能不能发"：**官方客户端确实会这么发**（只 warn 不拦），
+> 但服务端接不接受仍未验证。网上流传的"实测无效"已被证伪
+> （那个日志里失败的是富文本降级重试，仍带着旧 token，tokenless 分支从未触发）。
 
 ---
 
