@@ -1,0 +1,22 @@
+# 依赖
+node_modules/
+
+# 构建产物 (打 release 时才生成, 不进仓库)
+main.js
+*.js.map
+
+# Obsidian 插件的运行时数据 —— 含 iLink bot_token, 绝对不能进 git
+data.json
+
+# 本地测试用的 vault
+test-vault/
+
+# 环境
+.env
+.env.local
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
