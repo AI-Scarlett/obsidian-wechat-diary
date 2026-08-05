@@ -1,305 +1,361 @@
 # iLink 协议笔记
 
-> **这份文档比代码值钱。**
+> **重大更新 · 2026-08-05：协议的权威来源找到了。**
 >
-> iLink（`ilinkai.weixin.qq.com`）没有公开的开发者文档，下面所有内容都是
-> wechat-diary (Python 版) 逆向 + 实测得出的。重写成 TypeScript 时如果丢了这些，
-> 就得从头再逆向一遍。
+> 之前以为 iLink 没有公开文档、只能逆向。**错了。** 它是腾讯官方产品「微信 ClawBot 插件」，
+> 腾讯以 `Tencent` 名义开源了完整实现，而且**发布了 TypeScript 源码**——
+> 正好就是插件版要用的语言。
 >
-> 来源：`019Dairy/src/ilink.py`（逐行提炼，标注了原始行号）
-> 提炼日期：2026-08-05 · 对应 Python 版最后提交 `8febfd1`
+> ```bash
+> curl -sL https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.6.tgz \
+>   | tar xz && ls package/src/
+> ```
+>
+> - npm: `@tencent-weixin/openclaw-weixin` · author `Tencent` · MIT · latest **2.4.6** (2026-06-22)
+> - 6 名维护者邮箱全部 `@tencent.com`
+> - `src/api/types.ts` 就是协议的 spec（注释里写明 mirrors proto）
+>
+> ⚠️ **只信 `src/`，不要信 README。** 官方 README 的 header 表少列了 3 个、
+> 对 `-14` 的说法已被代码推翻、全文甚至不出现 `channel_version` 一词。
+>
+> 本文档中标 ✅ 的条目 = 已从官方源码逐行独立核实（2026-08-05）。
 
 ---
 
 ## 0. 一句话
 
-iLink 是微信侧的 bot 接入通道：扫码换 `bot_token` → 长轮询收消息 → 带
-`context_token` 回消息。**没有 webhook，没有服务器要求，纯客户端主动拉取** ——
-这正是它能做"纯本地部署"的原因。
+扫码换 `bot_token` → 长轮询收消息 → 带 `context_token` 回消息。
+**没有 webhook、不需要公网 IP、纯客户端出站拉取**——这正是它能做"纯本地部署"的原因，
+也是它在所有微信通道里最适合本项目的根本理由。
 
 ---
 
-## 1. 基础
+## 1. 🔴 019 现有实现与官方的 5 处实质偏差
 
+**这是本文档最重要的一节。** 移植到 TS 时必须修掉，019 也应该跟着改。
+
+### ① `-14` 的处理是反的 —— 最严重 ✅
+
+| | 019 现在的做法 | 官方做法 |
+|---|---|---|
+| 语义理解 | session 过期，需要重新登录 | **stale token**（v2.4.5 起常量已从 `SESSION_EXPIRED_ERRCODE` 改名为 `STALE_TOKEN_ERRCODE`） |
+| 处理 | 返回 exit code 2 → `start.bat` 删 state → **重新扫码** | `pauseSession()` —— **暂停该账号 1 小时**，不清 token、不通知用户、不重新登录；冷却后用同一 token 继续轮询 |
+
+官方源码（`src/api/session-guard.ts`）：
+```ts
+const SESSION_PAUSE_DURATION_MS = 60 * 60 * 1000;   // 整整一小时
+export const STALE_TOKEN_ERRCODE = -14;
+export function pauseSession(accountId: string): void { ... }
 ```
-BASE_URL = https://ilinkai.weixin.qq.com          (ilink.py:35)
-base_info = { "channel_version": "1.0.2" }        (ilink.py:55, 可用 env 覆盖)
+
+**为什么严重**：收到 `-14` 就重新扫码，既没必要（token 其实还能用），
+又可能在腾讯侧放大风控异常。第三方实现的注释原话就是这么做是为了
+"prevent triggering risk controls"。
+
+### ② `longpolling_timeout_ms` 方向搞反了 ✅
+
+官方 `src/api/types.ts`：
+```ts
+export interface GetUpdatesReq {
+  sync_buf?: string;          // @deprecated
+  get_updates_buf?: string;   // ← 请求体只有这两个字段
+}
+export interface GetUpdatesResp {
+  ...
+  /** Server-suggested timeout (ms) for the next getUpdates long-poll. */
+  longpolling_timeout_ms?: number;    // ← 它是【响应】字段
+}
 ```
 
-`base_info` 几乎每个 POST 请求都要带。`channel_version` 的作用未知——不确定
-服务端是否校验、不同值有什么区别。**这是待验证项之一。**
+019 把它塞进**请求体**（`run_loop` 发 3000，`probe_session` 发 100）。
+**请求体里根本没有这个字段，服务端会忽略。**
 
-### 认证 header（拿到 bot_token 之后所有请求）
+正确做法：请求不带它；读**响应**里的建议值，用来设下一轮的客户端超时。
+官方默认值 `DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000`。
+
+> ⚠️ **调研报告在这里自相矛盾，我按官方源码纠正**：报告一边正确指出"它是响应字段"，
+> 一边又推论"所以实际只 hang 3 秒，插件长轮询很轻松"。**后半句是错的**——
+> 既然请求体里的 3000 被忽略，服务端实际 hold 多久是未知的，官方客户端按 **35 秒**
+> 准备。所以插件的 HTTP 层**必须能撑住 35 秒不返回**，不能按 3 秒设计。
+
+### ③ `BASE_URL` 不该硬编码 ✅
+
+019 在 `ilink.py:35` 硬编码 `https://ilinkai.weixin.qq.com`。
+官方是**登录 confirmed 时服务端下发 `baseUrl`**，之后所有调用都用下发的那个
+（`src/channel.ts` 里 `account.baseUrl` 贯穿全部调用；CDN 地址同理，
+`src/cdn/cdn-url.ts` 里没有任何硬编码域名）。
+
+腾讯若做分区/灰度调度，硬编码会在某些账号上直接失效。
+
+### ④ 扫码状态机漏了 4 个状态，还多了 3 个不存在的 ✅
+
+官方 8 个状态（`src/auth/login-qr.ts:15`）：
+```ts
+"wait" | "scaned" | "confirmed" | "expired"
+| "scaned_but_redirect" | "need_verifycode" | "verify_code_blocked" | "binded_redirect"
+```
+
+| 状态 | 含义 | 019 的处理 |
+|------|------|-----------|
+| `wait` | 等待扫码 | 落到 else，继续轮询 ✓ |
+| `scaned` | 已扫，等确认 | 同上 ✓ |
+| `confirmed` | 确认成功 | ✓ |
+| `expired` | 二维码过期 | ✓ |
+| `scaned_but_redirect` | **要换个 host 继续轮询** | ❌ 不认识 → 空等到超时 |
+| `need_verifycode` | **需要输入验证码**（账号级风控） | ❌ 不认识 → 空等 5 分钟 |
+| `verify_code_blocked` | **验证码被封** | ❌ 不认识 → 空等 5 分钟 |
+| `binded_redirect` | 该 bot 已绑到别处 | ❌ 不认识 |
+| ~~`cancel`/`canceled`/`cancelled`~~ | **官方根本没有这三个** | 019 专门写了分支——要么对应未文档化的返回，要么是死代码 |
+
+**`need_verifycode` 的存在证明腾讯对具体账号会做验证码级风控。**
+触发条件、阈值、解封方式全部无文档。
+
+### ⑤ header 和 `base_info` 少了字段 ✅
+
+官方 `src/api/api.ts`：
+```ts
+const CHANNEL_VERSION = pkg.version ?? "unknown";   // ← 就是插件自己的版本号
+// header
+"iLink-App-Id": ILINK_APP_ID,      // 019 没发 —— 取值来自 package.json 的 ilink_appid
+// base_info
+{ channel_version: CHANNEL_VERSION,
+  bot_agent: sanitizeBotAgent(...) }               // 019 没发
+```
+
+- `channel_version = "1.0.2"` **过时了三个大版本**（latest 2.4.6，连 legacy tag 都是 1.0.3）。
+  目前还跑得通，但服务端校不校验、发旧值会不会被拒——**查不到**。
+- `bot_agent` 是 UA 风格的自我标识（`Name/Version`，ASCII，≤256 字节），
+  官方注释说"仅用于日志归因，不参与鉴权或路由"。**建议老实填 `obsidian-wechat-diary/x.y.z`**，
+  将来出问题腾讯侧能归因到你。
+
+---
+
+## 2. 协议细节（以官方 `src/api/types.ts` 为准）
+
+### 认证 header
 
 ```
 Content-Type:       application/json
 AuthorizationType:  ilink_bot_token
 Authorization:      Bearer {bot_token}
-X-WECHAT-UIN:       {base64(随机整数 0..0xFFFFFFFF)}
+X-WECHAT-UIN:       {base64(随机整数)}
+iLink-App-Id:       bot                    ← 019 缺
+SKRouteTag:         (条件性)                ← 019 缺
 ```
-（`ilink.py:130-136`）
 
-⚠️ `X-WECHAT-UIN` **每个请求都重新随机生成**（`_random_uin()`, `ilink.py:126`），
-服务端照收不误。说明它不参与身份校验，可能只是个埋点字段。重写时照抄即可，
+`X-WECHAT-UIN` 每个请求重新随机生成，服务端照收——不参与身份校验，照抄即可，
 不要试图让它稳定。
 
----
+### 端点
 
-## 2. 四个端点
+| 端点 | 用途 | 019 有没有 |
+|------|------|-----------|
+| `GET /ilink/bot/get_bot_qrcode?bot_type=3` | 取登录二维码 | ✅ |
+| `GET /ilink/bot/get_qrcode_status?qrcode=` | 轮询扫码状态（header 用 `iLink-App-ClientVersion: 1`） | ✅ |
+| `POST /ilink/bot/getupdates` | 长轮询收消息 | ✅ |
+| `POST /ilink/bot/sendmessage` | 发消息 | ✅ |
+| `getuploadurl` / `getconfig` / `sendtyping` / `msg/notifystop` / `msg/notifystart` | 媒体上传、配置、输入态、中断控制 | ❌ 全没有 |
 
-### 2.1 取登录二维码
+### 枚举（`src/api/types.ts` 逐字）✅
 
+```ts
+MessageType     = { NONE:0, USER:1, BOT:2 }
+MessageState    = { NEW:0, GENERATING:1, FINISH:2 }
+MessageItemType = { NONE:0, TEXT:1, IMAGE:2, VOICE:3, FILE:4, VIDEO:5,
+                    TOOL_CALL_START:11, TOOL_CALL_RESULT:12 }
 ```
-GET /ilink/bot/get_bot_qrcode?bot_type=3
-无需认证 header
-```
 
-返回：
-```json
+**019 硬编码的 `message_type=2, message_state=2` 是对的** —— 即 BOT + FINISH。
+（019 的注释写着"含义未知"，现在可以填上了。）
+
+图片/文件/视频走 CDN 且 **AES-128-ECB 加密**（`src/cdn/aes-ecb.ts`）。
+019 只处理 TEXT(1) 和 VOICE(3)，其余忽略——对日记场景够用。
+
+### 收到的消息
+
+```jsonc
 {
-  "qrcode": "<token字符串, 用于后续轮询状态>",
-  "qrcode_img_content": "<二维码图片的 URL>"
-}
-```
-
-❓ `bot_type=3` 的含义未知，1 和 2 是什么没试过。
-
-### 2.2 轮询扫码状态
-
-```
-GET /ilink/bot/get_qrcode_status?qrcode={上一步的 qrcode}
-header: iLink-App-ClientVersion: 1        ← 注意是这个，不是 bot_token 那套
-HTTP timeout 35s，每秒轮一次，总共等 300s
-```
-
-返回 `status` 字段。**代码里明确处理的取值**（`ilink.py:330-355`）：
-
-| status | 含义 | 处理 |
-|--------|------|------|
-| `confirmed` | 用户在微信里点了确认 | 保存 state，登录成功 |
-| `expired` | 二维码过期 | 要求重新扫码 |
-| `cancel` / `canceled` / `cancelled` | 用户取消 | 退出（三种拼写都兼容，说明实测见过不止一种） |
-| 其他 | 等待中 | 继续轮询 |
-
-❓ "等待中"的具体字符串是什么，代码没记录（只是打印出来）。重写时建议把所有
-见过的 status 值记下来补进这张表。
-
-`confirmed` 时返回：
-```json
-{
-  "status": "confirmed",
-  "bot_token": "...",
-  "ilink_bot_id": "...",
-  "ilink_user_id": "..."     ← 这就是用户身份，Python 版让用户手动抄进 .env（应该自动回填）
-}
-```
-
-### 2.3 收消息（长轮询）
-
-```
-POST /ilink/bot/getupdates
-认证 header
-body: {
-  "get_updates_buf": "<cursor, 首次为空字符串>",
-  "base_info": { "channel_version": "1.0.2" },
-  "longpolling_timeout_ms": 3000
-}
-HTTP 层 timeout: 35s
-```
-
-返回：
-```json
-{
-  "get_updates_buf": "<新 cursor, 变了就要持久化>",
-  "msgs": [ ... ]
-}
-```
-
-**cursor 机制是离线补拉的关键**（`ilink.py:488-493`）：把 `get_updates_buf`
-存盘，重启后带上它，服务端会把离线期间的消息补给你。
-
-⚠️ **服务端缓冲窗口有多久是未知的。** Python 版 README 只敢写"短时离线已实测可补收，
-长时间离线的缓冲窗口未知"。这直接决定「用户白天不开 Obsidian，晚上开了能不能补收今天的消息」
-—— **对插件形态是关键问题，必须实测。**
-
-注意 `longpolling_timeout_ms: 3000` 但 HTTP timeout 给了 35s。也就是说服务端
-最多 hang 3 秒就返回。**这个数字对 Obsidian 插件很重要**：如果 `requestUrl()`
-有超时上限，3 秒的长轮询比 30 秒的容易活下来。（Python 版用 35s 的 HTTP timeout
-是留余量，不是长轮询真的会 hang 那么久。）
-
-### 2.4 发消息
-
-```
-POST /ilink/bot/sendmessage
-认证 header
-body: {
-  "msg": {
-    "from_user_id": "",                          ← 固定空串
-    "to_user_id": "<对方 user_id>",
-    "client_id": "diary:{毫秒时间戳}-{8位随机hex}",  ← 幂等/去重用，自己生成
-    "message_type": 2,
-    "message_state": 2,
-    "context_token": "<从收到的消息里取, 见下>",
-    "item_list": [ { "type": 1, "text_item": { "text": "回复内容" } } ]
-  },
-  "base_info": { "channel_version": "1.0.2" }
-}
-```
-（`ilink.py:376-401`）
-
-❓ `message_type: 2` / `message_state: 2` 的含义未知，照抄。
-
----
-
-## 3. 消息结构（收到的）
-
-```json
-{
-  "seq": "...",              // 或 "message_id"，两个字段名都见过，用来去重
+  "seq": "...",              // 或 "message_id"，去重用
   "from_user_id": "...",
-  "context_token": "...",    // ← 关键，见第 4 节
+  "context_token": "...",    // ← 见第 3 节
   "item_list": [
-    { "type": 1, "text_item":  { "text": "文字内容" } },
-    { "type": 3, "voice_item": { "text": "语音的转写文本" } }
+    { "type": 1, "text_item":  { "text": "文字" } },
+    { "type": 3, "voice_item": { "text": "微信已转写好的文字" } }
   ]
 }
 ```
 
-**已知的 item type**：
+语音是**微信自己转写好的**，不需要你做 ASR。转写失败时 text 为空。
 
-| type | 含义 | 备注 |
-|------|------|------|
-| 1 | 文本 | |
-| 3 | 语音 | `voice_item.text` 是**微信自己转写好的文字**，不需要你做 ASR。转写失败时 text 为空，要提示用户改发文字 |
+### 错误码
 
-❓ 图片、文件、视频是 type 几，没试过。Python 版直接忽略未知 type。
+字段可能叫 `ret` 也可能叫 `errcode`，**两个都要读**。
 
-⚠️ 一条消息的 `item_list` 可能有多项，Python 版是**逐项独立处理并各回一条**
-（`ilink.py:512`）。这个行为对不对没验证过。
-
----
-
-## 4. context_token —— 主动推送的命脉
-
-**这是整个协议里最需要理解的机制。**
-
-- `context_token` 只能从**用户发来的消息**里拿到（`ilink.py:505`）
-- 想主动给用户发消息（比如晚上的日记提醒），必须带一个**还有效的** `context_token`
-- Python 版的做法：每收到一条消息就把 `context_token` 连同时间戳缓存进 state
-  （`ilink.py:506-510`），发提醒时取出来用
-
-**新鲜度判断**（`ilink.py:404-412`）：
-```python
-def _is_token_fresh(info, max_hours=20):   # ← 20 是作者设的阈值
-```
-
-⚠️ **这个 20 小时是 Python 版作者自己设的保守值，不确定是不是官方规则。**
-README 里写成了"iLink 限制 bot 超过约 20 小时无互动就不能主动发消息（平台反骚扰规则）"，
-但代码里没有任何官方文档依据。**这一条正在调研核实中，结论出来要回填到这里。**
-
-### 💀 由此推出的核心缺陷（已确认）
-
-```
-昨晚 22:05 用户回复了提醒     ← token 从这一刻开始计时
-今晚 22:00 定时提醒触发       ← 距上次互动 23.9 小时 > 20 小时
-                             → token 已判定为不新鲜，提醒直接跳过
-```
-
-**每天固定同一时钟时间提醒，间隔天然接近 24 小时，必然掉出窗口。**
-越规律越发不出去。这就是"装了但用不起来"的技术根因。
-
-**修复方向**：按「距上次互动的时长」触发，而不是按时钟时间。例如上次互动
-+18 小时就推，卡在窗口关闭前。时间会逐日前漂，但至少发得出去。
-（真正的解法还需要多路冗余，见 `00-decisions.md` D3。）
-
----
-
-## 5. 错误码
-
-响应里的错误码字段可能叫 `ret`，也可能叫 `errcode`（`ilink.py:155-157`，两个都要读）。
-非 0 即错误，`errmsg` 是描述。
-
-| 码 | 含义 | 处理 |
+| 码 | 含义 | 来源 |
 |----|------|------|
-| `-14` | session 过期 | 必须重新扫码登录。Python 版返回 exit code 2，由 start.bat 清 state 后重新走登录流程 |
-| 其他 | 未知 | 只有 -14 是确认过的，**其他错误码全是未知领域** |
-
-重写时建议：把所有遇到的非 0 码连同 `errmsg` 记进日志，慢慢补全这张表。
+| `-14` | stale token → **退避 1 小时**，不重新登录 | ✅ 官方源码 |
+| `-2` | **语义不明**。社区两份文档互相矛盾（一说无效 token，一说参数错误），实际 issue 里有人当限流 | ⚠️ 待实测 |
+| 其他 | 官方无完整错误码表 | 遇到就记日志，慢慢补 |
 
 ---
 
-## 6. 网络怪癖（踩过的坑）
+## 3. context_token 与提醒问题的真相
 
-### 6.1 iLink API 必须直连，不能走代理
+### 3.1 机制
 
-Python 版用了"三重保险"强制绕过代理（`ilink.py:40-43`）：
+`context_token` 只能从**用户发来的消息**里拿到。想主动推送（晚上的日记提醒），
+必须带一个还有效的 `context_token`。019 的做法是每收一条消息就缓存它 + 时间戳。
+
+### 3.2 🔴 「20 小时」是编的
+
+> **019 的 README 写着「iLink 限制 bot 超过约 20 小时无互动就不能主动发消息
+> （平台反骚扰规则，无法绕开）」。**
+>
+> **这句话没有任何依据。** 腾讯官方源码、README、CHANGELOG、以及查到的
+> 全部社区文档，**没有一处提到 20 小时**，"平台反骚扰规则"这个定性同样零出处。
+
+代码层面可以确证它是本地拍脑袋的启发式（`ilink.py:404`）：
 ```python
-for _proxy_env in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-    os.environ.pop(_proxy_env, None)
-os.environ["NO_PROXY"] = "*"
-os.environ["no_proxy"] = "*"
+def _is_token_fresh(info, max_hours=20):
+    # 只做一件事: 本地时间戳相减
+    # 不发任何网络请求, 不读任何服务端字段
 ```
-症状：走 Clash 会出现 TLS 中间层延迟、二维码状态轮询超时。
-注意 Clash 的 **TUN 模式是 OS 层劫持，代码层面绕不过去**，只能让用户加直连规则。
+而 `send_to_user`（`:415-421`）判定不 fresh 时**直接 print 跳过、根本不调 sendmessage**。
 
-> 插件版备注：`requestUrl()` 是 Obsidian 自己实现的 HTTP 客户端，是否受系统代理
-> 影响、能不能绕过，**待调研确认**。如果 Obsidian 走 Electron 的网络栈，行为可能
-> 和 Python 的 urllib 完全不同。
+**也就是说：这条链路从未、也不可能从服务端观测过真实窗口。20 这个数字是猜的。**
 
-### 6.2 Windows 上 SSL 中断被误报成 KeyboardInterrupt
+旁证：README 自己用了"约"字；`scheduler.py` 的 docstring 把出处标为
+"015fridge 经验"（作者上一个项目）；20 恰好是 24 的保守打折。
 
-`ilink.py:290-303`：扫码轮询时，SSL recv 被 OS 网络栈打断，Python 在 Windows 下
-会误抛 `KeyboardInterrupt`（用户根本没按 Ctrl+C）。Python 版的处理是：当超时看待，
-等 1 秒重试，**连续 5 次**才真的退出。
+**社区流传的"24 小时"同样是假的** —— 追查发现它其实挂在 `typing_ticket`
+（输入状态票据）上，被搜索摘要串台后在博客圈互抄扩散。
 
-> 插件版备注：这是 Python/Windows 特有的 quirk，**TypeScript 版不会遇到**，
-> 这段逻辑可以整个丢掉。记在这里是为了防止以后有人看到 Python 版这段代码不明所以。
+**真实窗口是多少？没有任何人知道。** 两个踩坑最深的 issue 都只说"数小时"，
+且非独立观测。
 
-### 6.3 长轮询的正常超时不是错误
+### 3.3 💀 由此推出的产品死结
 
-长轮询协议下，服务端 hang 到 `longpolling_timeout_ms` 没消息就返回，客户端看起来
-像"超时"。Python 版设了降噪阈值：连续 5 次才告警，之后每 30 次提示一次
-（`ilink.py:52-53, 457-475`）。
+```
+用户每天写日记  → token 天然高频刷新 → 提醒发得出去（但他本来就不需要提醒）
+用户连续没写    → token 陈旧        → 提醒发不出去（而这正是最需要提醒的时刻）
+```
 
-**重写时务必保留这个心智**：偶发超时 = 正常心跳，不要吓唬用户。
+**提醒机制在最需要它的时刻必然失效。这就是"包括作者自己在内没人能持续使用"的技术根因。**
+
+叠加另一个更蠢的问题：每天固定同一时钟提醒，间隔接近 24 小时，
+**必然大于任何合理的窗口值**。越规律越发不出去。
+
+### 3.4 修复方向
+
+1. **删掉 `_is_token_fresh` 的时间预判，改成「到点就发、按返回码分流并记录」。**
+   现在是"我猜发不出去所以不发"——连试都不试。这不是为了测出真实窗口
+   （单用户每天一条，两周十几个聚集数据点，统计上测不出干净边界），
+   而是**不再白白放弃可能能发出去的时段**。
+2. 触发时机按「距上次互动的时长」而非时钟时间。
+3. ⚠️ **一条被误传的候选解法**：网上说"不带 context_token 降级发送"已被实测无效——
+   **核查发现这是假的**：那个被引为证据的失败日志里，失败的是"富文本降级成纯文本"的重试，
+   **仍然带着陈旧 token**，真正的 tokenless 分支从未被触发过。
+   **所以这个方案是「从未被验证」，不是「已验证无效」。值得自己实测一次。**
+4. 真正的解法是多路冗余，见 `00-decisions.md` D3。
 
 ---
 
-## 7. 消息去重
+## 4. 网络怪癖
 
-`seq`（或 `message_id`）进一个 Set，重复的跳过（`ilink.py:496-502`）。
-Set 超过 200 条就整个 clear。
+### 4.1 iLink 必须直连 —— 但插件版会丢掉这个能力 ⚠️
 
-> ⚠️ 小瑕疵：clear 的时候会把刚 add 进去的那条也清掉。实际影响极小，但重写时
-> 可以顺手改成保留最近 N 条（比如用数组做滑动窗口）。
+019 用"三重保险"强制绕过代理（`ilink.py:40-43`）：pop 掉 4 个代理环境变量
++ `NO_PROXY="*"` + `ProxyHandler({})`。症状：走 Clash 会 TLS 中间层延迟、
+二维码轮询超时。
+
+**插件版的坑**：Obsidian 的 `requestUrl()` 底层是 Electron `net.request`，
+官方文档明写它会"Automatic management of system proxy configuration" ——
+**强制跟随系统代理，无法逐请求 opt-out**。唯一后门是
+`session.defaultSession.setProxy()`，但那会影响**整个 Obsidian 的所有网络请求**。
+
+**→ 这是选 Node `https` 而不是 `requestUrl` 的一个具体的、非风格性的理由。**
+合规性没问题：官方规则只要求用了 Node API 就必须 `isDesktopOnly: true`
+（那条"不要用 fetch，要用 requestUrl"出自自查清单的 **Mobile support** 节，
+该节开头写明"Complete this section if you have `isDesktopOnly` set to false"）。
+
+### 4.2 Windows SSL 误报 KeyboardInterrupt
+
+`ilink.py:290-303` 的处理（连续 5 次才真退出）是 Python/Windows 特有 quirk，
+**TS 版不会遇到，整段可以丢掉**。记在这里免得以后有人看到不明所以。
+
+### 4.3 不要手设 `Content-Length` ✅
+
+官方 CHANGELOG v2.4.2 记载：Node 24 内置的 undici 拒绝手工设置的
+`Content-Length`，报 `UND_ERR_INVALID_ARG`，导致所有请求失败。
+
+### 4.4 长轮询的正常超时不是错误
+
+偶发 timeout = 正常心跳，别吓唬用户。019 的降噪阈值（连续 5 次才告警）保留这个心智。
+
+> ⚠️ 019 注释说"协议本身每隔几秒就会 timeout 重连"——**这个说法可能是
+> 把请求体里被忽略的 3000ms 当真了**。实际服务端 hold 多久未知。待实测。
 
 ---
 
-## 8. 待验证清单（重写时要逐个实测）
+## 5. 消息去重与冷启动
 
-这些是公开资料查不到、只能靠实测的。按重要性排序：
+`seq`/`message_id` 进 Set，超 200 条 clear（`ilink.py:496-502`）。
 
-| # | 问题 | 为什么重要 |
+⚠️ **插件版更要紧**：Obsidian 被杀掉重启后插件会完整重新 `onload`，
+内存里的 `processed` set 全没了，而 cursor 是落盘的
+→ **每次冷启动都可能重放一段消息**。cursor 落盘必须保留，
+且去重要能跨重启（考虑把最近 N 个 seq 也落盘）。
+
+---
+
+## 6. 待验证清单
+
+**P0 —— 决定架构，必须先测**
+
+| # | 问题 | 为什么阻塞 |
 |---|------|-----------|
-| 1 | **cursor 的离线消息缓冲窗口有多久？** | 决定"用户白天不开 Obsidian，晚上开了能不能补收" |
-| 2 | **20 小时限制是官方规则还是作者猜的？确切数字是多少？** | 决定提醒机制怎么设计 |
-| 3 | `requestUrl()` 能不能撑住长轮询？有没有超时上限？ | 决定插件形态**是否可行** |
-| 4 | `requestUrl()` 受不受系统代理影响？ | 国内用户大多开着代理 |
-| 5 | 普通用户能不能自己扫码创建 bot？要不要审批？ | 决定 B 类用户能不能用 |
-| 6 | 图片 / 文件的 item type 是几？ | 未来功能 |
-| 7 | `channel_version` 服务端校不校验？现在最新是多少？ | 会不会哪天被强制升级打死 |
-| 8 | 完整的错误码表 | 错误处理质量 |
-| 9 | 扫码等待中的 status 字符串是什么 | 登录 UX |
+| 1 | **离线消息缓冲窗口有多久？旧 cursor 能补拉多远？** 停 5min / 1h / 6h / 24h 后重连各能拉回多少 | 决定"Obsidian 关掉一天，开了能不能补收" —— 这是插件形态最大的软肋 |
+| 2 | **真实推送窗口是多少？** 改成"到点就发、按返回码记录 token 年龄" | 决定提醒方案。⚠️ 别指望测出精确值 |
+| 3 | **`requestUrl` 能不能挂住 35 秒？** 控制台跑 `await requestUrl({url:'https://httpbin.org/delay/35'})` 计时 | 如果不行就只能用 Node https（反正也倾向用它，见 4.1） |
+
+**P1 —— 影响实现**
+
+| # | 问题 |
+|---|------|
+| 4 | 服务端校不校验 `channel_version`？同账号分别用 `1.0.2` 和 `2.4.6` 打 `getupdates` 比对 |
+| 5 | `ret=-2` 的准确语义 |
+| 6 | "不带 context_token 发送"到底可不可用（见 3.4 第 3 条） |
+| 7 | iLink 允不允许多客户端并发 `getupdates`？决定"Python 常驻 + 插件"能否并存过渡 |
+| 8 | 限流阈值（官方承认未公开） |
+| 9 | 019 那段 `cancel/canceled/cancelled` 分支到底对应什么 |
 
 ---
 
-## 附：Python 版原始实现的位置
+## 7. ⚠️ 两条不是技术问题的风险
 
-| 内容 | 文件:行 |
-|------|--------|
-| 全部协议调用 | `019Dairy/src/ilink.py` |
-| 登录流程 | `ilink.py:255-373` |
-| 长轮询主循环 | `ilink.py:425-547` |
-| 发消息 | `ilink.py:376-401` |
-| 主动推送 + token 新鲜度 | `ilink.py:404-422` |
-| 探活（快速版长轮询，timeout 100ms） | `ilink.py:230-252` |
+**① 自建客户端处于条款灰区。**
+《微信ClawBot功能使用条款》给腾讯单方面权利："有权决定支持本功能的微信软件客户端类型
+以及可使用本功能的条件、范围等规则"。条款通篇假定的形态是「ClawBot 插件 + 第三方 AI 服务」，
+**既未明文允许也未明文禁止绕开 OpenClaw 直连**。已有多个第三方项目公开这么做且未见被封报告，
+但这不构成保证。
+⚠️ 该条款全文只在社区镜像仓库读到，**没能定位腾讯自有域名上的原始 URL**——
+在合规这种高后果场景下，社区仓库文本可被增删改，不宜当权威引用。
+**建议在微信客户端内找到条款页核对。**
+
+**② 没有发信人白名单，陌生人可直接触达 bot。** ✅
+OpenClaw 的 pairing/allowlist 是**宿主功能，不是 iLink 协议层的**
+（官方文档原文："Direct messages use the normal OpenClaw pairing and allowlist model
+for channel plugins"）。自建客户端不会自动获得这层保护。
+019 靠 `user_id != config.USER_ID` 挡了一下，插件版必须保留并做好。
+
+---
+
+## 附：原始实现位置
+
+| 内容 | 位置 |
+|------|------|
+| **协议权威 spec** | `@tencent-weixin/openclaw-weixin@2.4.6` 的 `src/api/types.ts` |
+| 官方长轮询实现 | 同上 `src/monitor/monitor.ts` |
+| 官方 `-14` 处理 | 同上 `src/api/session-guard.ts` |
+| 官方扫码状态机 | 同上 `src/auth/login-qr.ts` |
+| 019 的全部协议调用 | `019Dairy/src/ilink.py`（607 行） |
