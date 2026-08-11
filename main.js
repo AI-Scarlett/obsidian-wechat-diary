@@ -2316,7 +2316,7 @@ var qrcode = function() {
 
 const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform } = require("obsidian");
 
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.1.1";
 const AGENT_NAME = "obsidian-wechat-diary";
 const BOT_AGENT = AGENT_NAME + "/" + PLUGIN_VERSION;
 const CHANNEL_VERSION = "2.4.6";               // 对齐官方 @tencent-weixin/openclaw-weixin
@@ -2330,6 +2330,7 @@ const SEND_TIMEOUT_MS = 15000;
 const NOTIFY_TIMEOUT_MS = 10000;
 const QR_FETCH_TIMEOUT_MS = 15000;
 const LOGIN_TOTAL_TIMEOUT_MS = 480000;
+const QR_LOCAL_TTL_MS = 5 * 60 * 1000;         // 单张二维码本地 TTL(同官方): 服务端不一定报 expired, 到点自己换码
 const STALE_TOKEN_ERRCODE = -14;
 const SESSION_PAUSE_MS = 60 * 60 * 1000;       // -14 冷却整 1 小时, 同官方
 const MAX_RECENT_SEQS = 200;
@@ -3454,9 +3455,25 @@ class QrLoginModal extends Modal {
       this._renderQr(qrPageUrl);
       this._setStatus("等待扫码…");
       let pollBase = FIXED_BASE_URL;
+      let qrIssuedAt = Date.now();
+      const refreshQr = async (statusText) => {
+        refreshes += 1;
+        if (refreshes > 3) return false;
+        const fresh = await client.getQrcode(plugin.getBotToken() ? [plugin.getBotToken()] : []);
+        ticket = fresh.qrcode;
+        verifyCode = null; // 新码不携带旧验证码
+        qrIssuedAt = Date.now();
+        this._renderQr(fresh.qrPageUrl);
+        this._setStatus(statusText);
+        return true;
+      };
 
       while (!this.aborted) {
         if (Date.now() - startTs > LOGIN_TOTAL_TIMEOUT_MS) { this._setStatus("登录超时了, 关掉重试一次吧"); return; }
+        if (Date.now() - qrIssuedAt > QR_LOCAL_TTL_MS) {
+          if (!(await refreshQr("二维码刷新了, 重新扫一下~"))) { this._setStatus("二维码多次失效, 稍后再试吧"); return; }
+          continue;
+        }
         let r;
         try {
           r = await client.pollQrStatus(pollBase, ticket, verifyCode);
@@ -3489,13 +3506,7 @@ class QrLoginModal extends Modal {
           return;
         }
         if (st === "expired") {
-          refreshes += 1;
-          if (refreshes > 3) { this._setStatus("二维码多次失效, 稍后再试吧"); return; }
-          const fresh = await client.getQrcode(plugin.getBotToken() ? [plugin.getBotToken()] : []);
-          ticket = fresh.qrcode;
-          verifyCode = null; // 新码不携带旧验证码
-          this._renderQr(fresh.qrPageUrl);
-          this._setStatus("二维码刷新了, 重新扫一下~");
+          if (!(await refreshQr("二维码刷新了, 重新扫一下~"))) { this._setStatus("二维码多次失效, 稍后再试吧"); return; }
           continue;
         }
         if (st === "scaned_but_redirect") {
@@ -3511,12 +3522,7 @@ class QrLoginModal extends Modal {
         }
         if (st === "verify_code_blocked") {
           verifyCode = null;
-          refreshes += 1;
-          if (refreshes > 3) { this._setStatus("验证码多次输错被暂时限制, 过一会儿再试"); return; }
-          const fresh = await client.getQrcode(plugin.getBotToken() ? [plugin.getBotToken()] : []);
-          ticket = fresh.qrcode;
-          this._renderQr(fresh.qrPageUrl);
-          this._setStatus("验证码多次输错, 换了张新码, 重新扫");
+          if (!(await refreshQr("验证码多次输错, 换了张新码, 重新扫"))) { this._setStatus("验证码多次输错被暂时限制, 过一会儿再试"); return; }
           continue;
         }
         if (st === "scaned") { verifyCode = null; this._setStatus("已扫码, 在手机上确认一下…"); } // 走到 scaned 说明验证码已通过, 清暂存(同官方)
@@ -3577,23 +3583,50 @@ class WechatDiarySettingTab extends PluginSettingTab {
         if (!bound) b.setDisabled(true);
       });
 
+    // 日记文件夹: 下拉选库里已有的文件夹; 想用新文件夹先在库里建好再回来选
+    const folderOptions = { "日记": "日记 (默认, 不存在会自动建)" };
+    try {
+      const folders = typeof this.app.vault.getAllFolders === "function"
+        ? this.app.vault.getAllFolders()
+        : this.app.vault.getAllLoadedFiles().filter((f) => Array.isArray(f.children));
+      for (const f of folders) {
+        if (f.path && f.path !== "/") folderOptions[f.path] = f.path;
+      }
+    } catch (e) { /* 拿不到目录列表就只剩默认项 */ }
+    const curFolder = plugin.settings.diaryFolder || "日记";
+    if (!folderOptions[curFolder]) folderOptions[curFolder] = curFolder;
     new Setting(containerEl)
       .setName("日记文件夹")
-      .setDesc("vault 内相对路径, 按 年/日期.md 存放 (与 Python 版 wechat-diary 数据契约一致)")
-      .addText((t) => t.setPlaceholder("日记")
-        .setValue(plugin.settings.diaryFolder)
-        .onChange(async (v) => { plugin.settings.diaryFolder = v.trim() || "日记"; await plugin.persist(); }));
+      .setDesc("按 年/日期.md 存放 (与 Python 版数据契约一致)。想用新文件夹: 先在库里建好, 回来就能选到")
+      .addDropdown((d) => d.addOptions(folderOptions)
+        .setValue(curFolder)
+        .onChange(async (v) => { plugin.settings.diaryFolder = v; await plugin.persist(); }));
 
-    new Setting(containerEl)
+    // 时区: 引擎支持就给完整 IANA 下拉, 不支持退回文本框
+    const curTz = plugin.settings.timezone || "Asia/Shanghai";
+    let tzList = [];
+    try { tzList = Intl.supportedValuesOf("timeZone"); } catch (e) { /* 老引擎 */ }
+    const tzSetting = new Setting(containerEl)
       .setName("时区")
-      .setDesc("日记文件名和时间戳所用时区, 默认北京时间")
-      .addText((t) => t.setPlaceholder("Asia/Shanghai")
-        .setValue(plugin.settings.timezone)
+      .setDesc("日记文件名和时间戳所用时区, 默认北京时间");
+    if (tzList.length) {
+      const tzOptions = {};
+      if (!tzList.includes(curTz)) tzOptions[curTz] = curTz;
+      for (const z of tzList) tzOptions[z] = z;
+      tzSetting.addDropdown((d) => d.addOptions(tzOptions).setValue(curTz)
+        .onChange(async (v) => {
+          plugin.settings.timezone = v;
+          setTimezone(v);
+          await plugin.persist();
+        }));
+    } else {
+      tzSetting.addText((t) => t.setPlaceholder("Asia/Shanghai").setValue(curTz)
         .onChange(async (v) => {
           plugin.settings.timezone = v.trim() || "Asia/Shanghai";
           setTimezone(plugin.settings.timezone);
           await plugin.persist();
         }));
+    }
 
     new Setting(containerEl).setName("AI 润色与闲聊 (可选)").setHeading();
     containerEl.createEl("p", {
@@ -3664,7 +3697,8 @@ class WechatDiaryPlugin extends Plugin {
     this._unloaded = false;
     this._activeQrModal = null;
 
-    this.addSettingTab(new WechatDiarySettingTab(this.app, this));
+    this.settingTab = new WechatDiarySettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
     this.statusEl = this.addStatusBarItem();
     this._setStatus("未绑定");
 
@@ -3751,6 +3785,14 @@ class WechatDiaryPlugin extends Plugin {
     }
     await this.persist();
     this.startPipeline();
+    this._refreshSettingsUi(); // 绑定成功后设置页立即显示"已绑定", 不能还挂着扫码按钮
+  }
+
+  _refreshSettingsUi() {
+    try {
+      const t = this.settingTab;
+      if (t && t.containerEl && t.containerEl.childElementCount > 0) t.display();
+    } catch (e) { /* 设置页没开着, 不用刷 */ }
   }
 
   async unbind() {
