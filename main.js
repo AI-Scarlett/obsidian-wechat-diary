@@ -2314,9 +2314,9 @@ var qrcode = function() {
 // 以下为 WeChat Diary 插件本体。文件末尾的 module.exports 覆盖上方 UMD 段的赋值。
 // ═══════════════════════════════════════════════════════════════════════
 
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform, AbstractInputSuggest } = require("obsidian");
 
-const PLUGIN_VERSION = "0.1.2";
+const PLUGIN_VERSION = "0.1.3";
 const AGENT_NAME = "obsidian-wechat-diary";
 const BOT_AGENT = AGENT_NAME + "/" + PLUGIN_VERSION;
 const CHANNEL_VERSION = "2.4.6";               // 对齐官方 @tencent-weixin/openclaw-weixin
@@ -3587,24 +3587,37 @@ class WechatDiarySettingTab extends PluginSettingTab {
         if (!bound) b.setDisabled(true);
       });
 
-    // 日记文件夹: 下拉选库里已有的文件夹; 想用新文件夹先在库里建好再回来选
-    const folderOptions = { "日记": "日记 (默认, 不存在会自动建)" };
-    try {
-      const folders = typeof this.app.vault.getAllFolders === "function"
-        ? this.app.vault.getAllFolders()
-        : this.app.vault.getAllLoadedFiles().filter((f) => Array.isArray(f.children));
-      for (const f of folders) {
-        if (f.path && f.path !== "/") folderOptions[f.path] = f.path;
-      }
-    } catch (e) { /* 拿不到目录列表就只剩默认项 */ }
+    // 日记文件夹: 输入即搜索(同核心设置"附件默认存放路径"的交互)——
+    // 打字过滤全库任意深度的文件夹, 点选即填; 输入不存在的路径会在写入时自动创建
     const curFolder = plugin.settings.diaryFolder || "日记";
-    if (!folderOptions[curFolder]) folderOptions[curFolder] = curFolder;
+    const appRef = this.app;
     new Setting(containerEl)
       .setName("日记文件夹")
-      .setDesc("按 年/日期.md 存放 (与 Python 版数据契约一致)。想用新文件夹: 先在库里建好, 回来就能选到")
-      .addDropdown((d) => d.addOptions(folderOptions)
-        .setValue(curFolder)
-        .onChange(async (v) => { plugin.settings.diaryFolder = v; await plugin.persist(); }));
+      .setDesc("按 年/日期.md 存放 (与 Python 版数据契约一致)。打几个字搜索库里的文件夹(含子文件夹)直接选; 输入新路径会自动创建")
+      .addText((t) => {
+        t.setPlaceholder("日记").setValue(curFolder)
+          .onChange(async (v) => { plugin.settings.diaryFolder = (v || "").trim() || "日记"; await plugin.persist(); });
+        if (typeof AbstractInputSuggest === "function") {
+          new (class extends AbstractInputSuggest {
+            getSuggestions(query) {
+              const q = (query || "").toLowerCase();
+              const folders = typeof appRef.vault.getAllFolders === "function"
+                ? appRef.vault.getAllFolders()
+                : appRef.vault.getAllLoadedFiles().filter((f) => Array.isArray(f.children));
+              return folders
+                .filter((f) => f.path && f.path !== "/" && f.path.toLowerCase().includes(q))
+                .slice(0, 80);
+            }
+            renderSuggestion(folder, el) { el.setText(folder.path); }
+            selectSuggestion(folder) {
+              t.setValue(folder.path);
+              plugin.settings.diaryFolder = folder.path;
+              plugin.persist();
+              this.close();
+            }
+          })(appRef, t.inputEl);
+        }
+      });
 
     // 时区: 引擎支持就给完整 IANA 下拉, 不支持退回文本框
     const curTz = plugin.settings.timezone || "Asia/Shanghai";
