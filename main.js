@@ -3461,7 +3461,7 @@ class QrLoginModal extends Modal {
         try {
           r = await client.pollQrStatus(pollBase, ticket, verifyCode);
         } catch (e) {
-          await sleep(1000); // 网关抖动(5xx/524 等)视为 wait
+          await sleepMs(1000); // 网关抖动(5xx/524 等)视为 wait
           continue;
         }
         if (r.__timeout) continue; // 长轮询正常心跳
@@ -3521,7 +3521,7 @@ class QrLoginModal extends Modal {
         }
         if (st === "scaned") { verifyCode = null; this._setStatus("已扫码, 在手机上确认一下…"); } // 走到 scaned 说明验证码已通过, 清暂存(同官方)
         // wait 及未知状态(官方枚举外): 继续轮询
-        await sleep(1000);
+        await sleepMs(1000);
       }
     } catch (e) {
       console.error("[wechat-diary] 登录失败:", e);
@@ -3532,7 +3532,7 @@ class QrLoginModal extends Modal {
   }
 }
 
-function sleep(ms) { return new Promise((r) => window.setTimeout(r, ms)); }
+function sleepMs(ms) { return new Promise((r) => window.setTimeout(r, ms)); }
 
 class ConfirmUnbindModal extends Modal {
   constructor(app, onConfirm) { super(app); this.onConfirm = onConfirm; }
