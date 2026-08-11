@@ -2316,7 +2316,7 @@ var qrcode = function() {
 
 const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform } = require("obsidian");
 
-const PLUGIN_VERSION = "0.1.1";
+const PLUGIN_VERSION = "0.1.2";
 const AGENT_NAME = "obsidian-wechat-diary";
 const BOT_AGENT = AGENT_NAME + "/" + PLUGIN_VERSION;
 const CHANNEL_VERSION = "2.4.6";               // 对齐官方 @tencent-weixin/openclaw-weixin
@@ -3471,7 +3471,11 @@ class QrLoginModal extends Modal {
       while (!this.aborted) {
         if (Date.now() - startTs > LOGIN_TOTAL_TIMEOUT_MS) { this._setStatus("登录超时了, 关掉重试一次吧"); return; }
         if (Date.now() - qrIssuedAt > QR_LOCAL_TTL_MS) {
-          if (!(await refreshQr("二维码刷新了, 重新扫一下~"))) { this._setStatus("二维码多次失效, 稍后再试吧"); return; }
+          try {
+            if (!(await refreshQr("二维码刷新了, 重新扫一下~"))) { this._setStatus("二维码多次失效, 稍后再试吧"); return; }
+          } catch (e) {
+            await sleepMs(2000); // 主动换码撞上网络抖动: 重试, 别把登录整个判死(refreshes 计数天然封顶)
+          }
           continue;
         }
         let r;
