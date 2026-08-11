@@ -1,0 +1,10 @@
+{
+  "id": "wechat-diary",
+  "name": "WeChat Diary",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Capture diary entries and quick notes by chatting to a WeChat bot. Messages land in your vault as daily Markdown files.",
+  "author": "ArtemisLin",
+  "authorUrl": "https://github.com/ArtemisLin",
+  "isDesktopOnly": true
+}
