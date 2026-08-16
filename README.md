@@ -63,7 +63,7 @@ source: wechat-diary
 ![[Diary/attachments/2026/2026-08-12-2305-a3f1.jpg]]
 ```
 
-Full rules in [docs/data-contract.md](docs/data-contract.md): append-only, Beijing-time dates (timezone configurable), one `\n\n`-separated block per message, sealing footnote on 「结束」.
+Full rules in [docs/data-contract.md](docs/data-contract.md): append-only, Beijing-time dates (timezone configurable), one `\n\n`-separated block per message, sealing footnote on 「结束」. Since v1.2 the day boundary is 4 AM — entries before 4 AM land in the previous day's file (night owls rejoice).
 
 ---
 
@@ -73,6 +73,7 @@ Full rules in [docs/data-contract.md](docs/data-contract.md): append-only, Beiji
 
 - 设置里扫码绑定一次, 之后手机上任何时刻发文字/语音/图片给 bot, Obsidian 开着就会写进 `日记/YYYY/YYYY-MM-DD.md`。
 - **发什么记什么, 不用任何开场白**——不用再说「开始记日记」了。「撤回」删掉最后一条, 「结束」是可选的收尾仪式(不发也没关系, 跨天自动收尾), 「帮助」看全部命令。「在吗」这类打招呼会得到状态回复, 不会被记进笔记。
+- **熬夜不怕跨天**: 凌晨 4 点前记的都算前一天, 睡前的话属于"今晚"。
 - 发图: 图片存进 `日记/attachments/YYYY/`, 笔记里插 `![[...]]`;「撤回」同样撤得掉(只删引用, 图片文件保留)。
 - **纯机械记录, 不经过任何 AI**——原文直存, 一个字不改。(设置里的 AI 配置暂未启用, 为将来的可选功能保留。)
 - 数据只在你机器上: 凭据存 Obsidian 密钥存储, 不进 vault、不被同步盘带走; 无遥测、无作者服务器。

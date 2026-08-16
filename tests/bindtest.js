@@ -182,7 +182,7 @@ async function newPlugin(secrets, storedData) {
   // ══ v0.3.0 单模式路由 ═══════════════════════════════════════════════════
 
   const BOUND_DATA = () => ({
-    settings: { diaryFolder: "日记", timezone: "Asia/Shanghai", aiApiUrl: "", aiModel: "", graceMinutes: 30 },
+    settings: { diaryFolder: "日记", timezone: "Asia/Shanghai", aiApiUrl: "", aiModel: "", dayStartHour: 4 },
     ilink: { botId: "B1", userId: "U1", baseUrl: "", buf: "", contextTokens: {}, recentSeqs: [], pauseUntil: 0, lastAliveTs: 0, loginTime: "x", botTokenFallback: "", skipBacklog: false },
     profile: { state: "active", name: null },
     session: { mode: "chat", entered_date: "", chat_count_today: 0, last_activity_ts: 0, cost_reminder_shown_date: "" },
@@ -193,7 +193,7 @@ async function newPlugin(secrets, storedData) {
     const calls = { writes: [], finalized: [] };
     p.writer.write = async (text) => { calls.writes.push(text); return { reply: "记下来啦~ 今天第 " + calls.writes.length + " 段 ✍️", n: calls.writes.length }; };
     p.writer.finalizeDay = async (d) => { calls.finalized.push(d || "today"); return calls.writes.length > 0; };
-    p.writer.undoLastBlock = async () => (calls.writes.length ? (calls.writes.pop(), true) : false);
+    p.writer.undoLastBlock = async () => (calls.writes.length ? { ok: true, removed: calls.writes.pop() } : { ok: false, removed: null });
     p.writer.countDay = async () => calls.writes.length;
     return calls;
   }
@@ -219,7 +219,7 @@ async function newPlugin(secrets, storedData) {
 
   console.log("\n【13】撤回与改称呼");
   r = await p.agent._dispatch("撤回", false, []);
-  check("「撤回」→ 删最后一条", calls.writes.length === 1, r);
+  check("「撤回」→ 删最后一条且带预览", calls.writes.length === 1 && r.includes("撤掉了「又想起一件事」"), r);
   r = await p.agent._dispatch("叫我小明", false, []);
   check("「叫我小明」短句 → 改称呼不落库", p.data.profile.name === "小明" && calls.writes.length === 1, r);
   r = await p.agent._dispatch("叫我妈过来吃饭的时候记得提醒我带上钥匙", false, []);
@@ -263,6 +263,28 @@ async function newPlugin(secrets, storedData) {
   await p.onLoginConfirmed({ botToken: "TOK2", botId: "B2", userId: "U1", baseUrl: "" });
   check("同人换 bot → 游标/去重表清零(否则新 bot 前 N 条被吞)", p.data.ilink.buf === "" && p.data.ilink.recentSeqs.length === 0);
   check("换 bot 不清称呼(还是同一个人)", p.data.profile.state === "active");
+
+  console.log("\n【18】逻辑日边界(契约 v1.2): 凌晨 4 点前算前一天");
+  const I = WechatDiaryPlugin.__internals;
+  I.setTimezone("Asia/Shanghai");
+  I.setDayStartHour(4);
+  check("凌晨 2:30 → 前一天", I.logicalTodayStr(new Date("2026-08-16T02:30:00+08:00")) === "2026-08-15", I.logicalTodayStr(new Date("2026-08-16T02:30:00+08:00")));
+  check("凌晨 3:59 → 前一天", I.logicalTodayStr(new Date("2026-08-16T03:59:00+08:00")) === "2026-08-15");
+  check("凌晨 4:00 → 当天", I.logicalTodayStr(new Date("2026-08-16T04:00:00+08:00")) === "2026-08-16");
+  check("白天 → 当天", I.logicalTodayStr(new Date("2026-08-16T15:00:00+08:00")) === "2026-08-16");
+  check("边界收口: 非法值回落 4", (I.setDayStartHour(99), I.logicalTodayStr(new Date("2026-08-16T03:00:00+08:00")) === "2026-08-15"));
+
+  console.log("\n【19】收尾语分时段");
+  check("21:30 → 夜", I.isNightNow(new Date("2026-08-16T21:30:00+08:00")) === true);
+  check("凌晨 2 点 → 夜(还没过边界)", I.isNightNow(new Date("2026-08-16T02:00:00+08:00")) === true);
+  check("14:00 → 日", I.isNightNow(new Date("2026-08-16T14:00:00+08:00")) === false);
+
+  console.log("\n【20】撤回预览与欢迎语(纯函数)");
+  check("文本截 12 字带省略", I.undoOkReply("今天试了新的手冲豆子花香很明显很满意") === "好的, 撤掉了「今天试了新的手冲豆子花香…」", I.undoOkReply("今天试了新的手冲豆子花香很明显很满意"));
+  check("语音 🎤 前缀剥掉", I.undoOkReply("🎤 早上开会说的三件事") === "好的, 撤掉了「早上开会说的三件事」");
+  check("图片块 → 说撤图", I.undoOkReply("![[日记/attachments/2026/x.jpg]]") === "好的, 撤掉了刚才那张图片");
+  check("欢迎语动态填文件夹", I.welcomeText("PersonalGuyu/Diary").includes("「PersonalGuyu/Diary」文件夹"));
+  check("欢迎语教在哪改", I.welcomeText("日记").includes("第三方插件 → WeChat Diary"));
 
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);

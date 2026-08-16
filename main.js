@@ -2343,14 +2343,16 @@ const QR_LOCAL_TTL_MS = 5 * 60 * 1000;         // 单张二维码本地 TTL(同�
 const STALE_TOKEN_ERRCODE = -14;
 const SESSION_PAUSE_MS = 60 * 60 * 1000;       // -14 冷却整 1 小时, 同官方
 const MAX_RECENT_SEQS = 200;
-const OFFLINE_NOTICE_GAP_H = 12;
+const OFFLINE_NOTICE_GAP_H = 24;   // 缓冲窗口 24h 内实测可补收(2026-08-16), 之内不吓唬用户
 
 const DEFAULT_SETTINGS = {
   diaryFolder: "日记",
   timezone: "Asia/Shanghai",
   aiApiUrl: "",
   aiModel: "",
-  graceMinutes: 30, // 午夜宽限期; 暂无设置 UI, 需要改的用户直接编辑插件 data.json
+  // 一天的边界(小时): 凌晨 4 点前记的都算前一天(契约 v1.2)。取代 v0.3.0 前的
+  // 滚动宽限期(graceMinutes, 已退役)。暂无设置 UI, 要改的用户直接编辑 data.json。
+  dayStartHour: 4,
 };
 
 // ── 北京时间工具(019 config.py 的教训: 禁止裸用宿主机本地时间)─────────
@@ -2373,6 +2375,22 @@ setTimezone(_tz);
 
 function todayStr(d) { return _dateFmt.format(d || new Date()); }
 function hhmmStr(d) { return _timeFmt.format(d || new Date()); }
+
+// ── 逻辑日(契约 v1.2): 凌晨 dayStartHour 点前算前一天 ──────────────────
+// 「今天的文件」一律用它; 段头时间戳仍是真实时间(00:30 出现在昨天的文件里, 日记本来如此)。
+let _dayStartHour = 4;
+function setDayStartHour(h) {
+  const n = Number(h);
+  _dayStartHour = Number.isFinite(n) && n >= 0 && n <= 12 ? Math.floor(n) : 4;
+}
+function logicalTodayStr(d) {
+  return todayStr(new Date((d ? d.getTime() : Date.now()) - _dayStartHour * 3600000));
+}
+// 现在是不是"深夜段"(20 点后到逻辑日边界前): 收尾语选晚安池用
+function isNightNow(d) {
+  const h = Number(hhmmStr(d).slice(0, 2));
+  return h >= 20 || h < _dayStartHour;
+}
 
 const WEEKDAY_CN = { Mon: "一", Tue: "二", Wed: "三", Thu: "四", Fri: "五", Sat: "六", Sun: "日" };
 function weekdayStr(d) { return "周" + (WEEKDAY_CN[_weekdayFmt.format(d || new Date())] || "?"); }
@@ -2400,12 +2418,17 @@ function randHex(n) {
 
 // ── 文案资产(v0.3.0 单模式全面改写; 019 双模式文案退役)─────────────────
 
-const WELCOME_TEXT = `嗨~ 我是你的随手记 Agent ✍️
+// 欢迎语按用户的日记文件夹设置动态生成: 入门用户得知道东西记去哪了、在哪改
+function welcomeText(folder) {
+  return `嗨~ 我是你的随手记 Agent ✍️
 
 想记什么直接发给我, 文字、语音、图片都行, 我会记到你今天的笔记里。
+记的东西在 Obsidian 的「${folder}」文件夹; 想换地方: Obsidian 设置 → 第三方插件 → WeChat Diary → 日记文件夹。
 说错了发「撤回」, 随时发「帮助」看全部用法。
 
 第一次见面, 你希望我叫你什么名字呢? (不想要称呼就发「跳过」)`;
+}
+const WELCOME_SNIPPET = "随手记 Agent"; // 测试与旧引用用
 
 const NAME_CONFIRM_TEMPLATE = "好的{name}~ 想记什么直接发我就行 ✍️";
 const NAME_SKIPPED_REPLY = "好的~ 那就不特别称呼啦 😊 想记什么直接发就行; 以后想让我称呼你, 随时发「叫我XX」";
@@ -2423,10 +2446,11 @@ const HELP_TEXT = `✍️ 微信随手记 使用指南
 【命令】
 • 撤回 → 删掉刚记的最后一条
 • 结束 → 给今天写个收尾标记 (不发也没关系, 跨天会自动收尾)
+• 在吗 → 看我在不在、今天记了几段
 • 叫我XX → 设置/修改你的称呼
 • 帮助 → 看到这条
 
-深夜过了零点也不怕, 半小时内继续说仍算前一晚。
+熬夜不怕跨天: 凌晨 4 点前记的都算前一天。
 Obsidian 没开着也能发, 24 小时内下次打开会自动补记。`;
 
 // 老用户习惯发「开始记日记」: 友好告知不用了, 不落库
@@ -2441,23 +2465,27 @@ function imageWrittenReply(n) {
   return "📷 图片收好啦~ 今天第 " + n + " 段 ✍️";
 }
 
-const CLOSING_LINES = [
-  "今天的故事我收好啦, 晚安 ✨",
+// 收尾语分时段(2026-08-16 谷雨审定): 备忘录用户中午也会「结束」, 白天说"晚安"违和。
+// 20 点后到逻辑日边界前用晚安池, 其余用中性池。
+const CLOSING_LINES_DAY = [
   "已经装订成册 📖",
   "归档完毕, 这一页属于今天了。",
+  "收进时光胶囊, 下次见。",
+  "咔哒, 打卡完成 ✓ 今天辛苦了。",
+];
+const CLOSING_LINES_NIGHT = [
+  "今天的故事我收好啦, 晚安 ✨",
   "小册子合上了, 安心睡吧。",
   "好了, 今天的心事都在本子里了。",
-  "日记本盖章 📮 愿今晚好梦。",
-  "收进时光胶囊, 明年今日再开。",
+  "笔记本盖章 📮 愿今晚好梦。",
   "今天的字, 都存好了, 晚安。",
-  "咔哒, 打卡完成 ✓ 今天辛苦了。",
-  "一天的褶皱, 已经熨平收好。",
 ];
-const CLOSING_FAREWELL_LINES = ["明天见 👋", "明天再聊~", "好梦, 明天见 🌙", "明天我等你 📖", "明天再见呀 ✨"];
-const CLOSING_LINES_WITH_NAME = [
+const CLOSING_FAREWELL_DAY = ["下次见 👋", "明天见 👋", "明天再见呀 ✨"];
+const CLOSING_FAREWELL_NIGHT = ["好梦, 明天见 🌙", "明天我等你 📖", "明天见 👋"];
+const CLOSING_WITH_NAME_DAY = ["{name}, 这一页属于今天, 收好了 📖"];
+const CLOSING_WITH_NAME_NIGHT = [
   "辛苦啦{name}~ 今天又记下了一些珍贵的东西 🌙",
   "{name}, 今天的故事我收好啦, 晚安 ✨",
-  "{name}, 这一页属于今天, 收好了 📖",
 ];
 
 // 探活回执(替代闲聊模式的问候回复): 回状态, 不落库。
@@ -2467,20 +2495,33 @@ function pingReply(n) {
   return "在的~ 想记什么直接发, 我都记着 ✍️";
 }
 
-// 每天第一条的回执前缀: 零动作给足"它在且在记"的信任信号
+// 每天第一条的回执前缀: 零动作给足"它在且在记"的信任信号; 完整命令提示每天只在这出现一次
 const FIRST_OF_DAY_PREFIX = "今天第一条, 已开新的一页 📖\n";
+const FIRST_OF_DAY_TIPS = "\n(说错了发「撤回」, 随时发「帮助」看全部用法)";
 
-const UNDO_OK_REPLY = "好的, 帮你撤回啦";
 const UNDO_EMPTY_REPLY = "今天还什么都没说呢, 没东西可撤哦";
 const FINALIZE_EMPTY_REPLY = "今天还没记东西呢~ 想记什么直接发";
-// 宽限期外跨天: 昨天已自动封存的告知(单模式: 新一天直接继续记, 无需任何动作)
-const GRACE_EXPIRED_NOTICE = "(昨天的记录我帮你自动收尾啦~ 现在说的会记到今天)";
+// 跨天后的第一条: 昨天已自动封存的告知(会替掉 FIRST_OF_DAY_PREFIX, 两句语义重复)
+const GRACE_EXPIRED_NOTICE = "(昨天的已自动收尾, 翻开新的一页 📖)";
+
+// 撤回回执带被撤内容预览: 用户要能确认撤对了。纯字符串, 不需要 AI。
+function undoOkReply(removed) {
+  if (!removed) return "好的, 帮你撤回啦";
+  if (removed.startsWith("![[")) return "好的, 撤掉了刚才那张图片";
+  const t = removed.replace(/^🎤 /, "").replace(/\n+/g, " ").trim();
+  const arr = [...t];
+  return "好的, 撤掉了「" + arr.slice(0, 12).join("") + (arr.length > 12 ? "…" : "") + "」";
+}
 
 function randomClosing(name) {
+  const night = isNightNow();
+  const namePool = night ? CLOSING_WITH_NAME_NIGHT : CLOSING_WITH_NAME_DAY;
+  const linePool = night ? CLOSING_LINES_NIGHT : CLOSING_LINES_DAY;
+  const byePool = night ? CLOSING_FAREWELL_NIGHT : CLOSING_FAREWELL_DAY;
   let head;
-  if (name && Math.random() < 0.3) head = randomChoice(CLOSING_LINES_WITH_NAME).split("{name}").join(name);
-  else head = randomChoice(CLOSING_LINES);
-  return head + "\n\n" + randomChoice(CLOSING_FAREWELL_LINES);
+  if (name && Math.random() < 0.3) head = randomChoice(namePool).split("{name}").join(name);
+  else head = randomChoice(linePool);
+  return head + "\n\n" + randomChoice(byePool);
 }
 
 // ── 意图识别(019 intents.py 移植 + 020「误切换吃内容」修复)──────────────
@@ -2938,7 +2979,7 @@ class DiaryWriter {
   async write(text, isVoice, dateStr) {
     text = (text || "").trim();
     if (!text) return { reply: "嗯? 没听清, 再说一次?", n: 0 };
-    const day = dateStr || todayStr();
+    const day = dateStr || logicalTodayStr();
 
     // 契约规则 6: 块内空行收敛为单个换行, 一次发送 = 一个块 = 一条消息
     let polished = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(NORMALIZE_BLANK_RE, "\n").trim();
@@ -2955,14 +2996,15 @@ class DiaryWriter {
     } catch (e) {
       console.error("[wechat-diary] 写日记失败:", e);
       // 【宿主适配】019 原文提的是「DIARY_DIR 所在盘」, 插件没有这个概念
-      if (String(e && e.message).includes("ENOSPC")) return { reply: "存日记失败! 磁盘可能满了 💾 请检查磁盘空间", n: 0 };
-      return { reply: "收到啦, 但写入时出了点问题, 等会儿再试试?", n: 0 };
+      if (String(e && e.message).includes("ENOSPC")) return { reply: "⚠️ 这条没记上! 磁盘可能满了 💾 请检查磁盘空间", n: 0 };
+      // 失败必须响亮: "收到啦"开头会让人误以为记上了——这条其实丢了
+      return { reply: "⚠️ 这条没记上! 写入出了问题, 等一会儿重发一次", n: 0 };
     }
 
     const n = countMessages(finalContent);
     const voiceMark = isVoice ? "🎤 " : "";
     let reply = voiceMark + "记下来啦~ 今天第 " + n + " 段 ✍️";
-    if (n === 1) reply = FIRST_OF_DAY_PREFIX + reply;
+    if (n === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
     return { reply, n };
   }
 
@@ -2970,7 +3012,7 @@ class DiaryWriter {
   async countDay(dateStr) {
     try {
       const vault = this.plugin.app.vault;
-      const path = this.diaryPath(dateStr || todayStr());
+      const path = this.diaryPath(dateStr || logicalTodayStr());
       const file = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
       if (!file) return 0;
       return countMessages(await vault.cachedRead(file));
@@ -2980,7 +3022,7 @@ class DiaryWriter {
   // 存一张图: 落进 vault 附件目录, 日记里插一个 ![[]] 块。
   // 返回 { n, diskFull }; n === 0 表示没写成。永不抛。
   async writeImage(buf, ext, dateStr) {
-    const day = dateStr || todayStr();
+    const day = dateStr || logicalTodayStr();
     const timestamp = hhmmStr();
     const vault = this.plugin.app.vault;
     let path = "";
@@ -3009,12 +3051,14 @@ class DiaryWriter {
   }
 
   // 撤回最后一条消息; 孤儿段头一并清理。返回是否删了东西。
+  // 返回 { ok, removed }: removed = 被删块的原文(回执预览用), 失败/无可撤时 null。
   async undoLastBlock(dateStr) {
-    const path = this.diaryPath(dateStr || todayStr());
+    const path = this.diaryPath(dateStr || logicalTodayStr());
     const vault = this.plugin.app.vault;
     const file = vault.getFileByPath(path);
-    if (!file) return false;
+    if (!file) return { ok: false, removed: null };
     let ok = false;
+    let removed = null;
     try {
       await vault.process(file, (content) => {
         const parts = content.split("\n\n");
@@ -3023,6 +3067,7 @@ class DiaryWriter {
           if (isMessageBlock(parts[i].trim())) { lastMsgI = i; break; }
         }
         if (lastMsgI < 0) return content;
+        removed = parts[lastMsgI].trim();
         const newParts = parts.slice(0, lastMsgI);
         while (newParts.length) {
           const tail = newParts[newParts.length - 1].trim();
@@ -3036,14 +3081,14 @@ class DiaryWriter {
       });
     } catch (e) {
       console.error("[wechat-diary] 撤回失败:", e);
-      return false;
+      return { ok: false, removed: null };
     }
-    return ok;
+    return { ok, removed: ok ? removed : null };
   }
 
   // 封存。空文件 false; 已封存 true(幂等)。
   async finalizeDay(dateStr) {
-    const path = this.diaryPath(dateStr || todayStr());
+    const path = this.diaryPath(dateStr || logicalTodayStr());
     const vault = this.plugin.app.vault;
     const file = vault.getFileByPath(path);
     if (!file) return false;
@@ -3358,22 +3403,19 @@ class DiaryAgent {
   get profile() { return this.plugin.data.profile; }
   get session() { return this.plugin.data.session; }
 
+  _welcome() { return welcomeText(this.plugin.settings.diaryFolder || "日记"); }
+
   // 跨天处理(020「午夜割裂」修复: 宽限期 + 显式告知)。
   // 返回 { graceDate?: string, expiredNotice?: string }
-  // 跨天处理(v0.3.0 单模式): 宽限期内仍算前一晚; 过期自动封存旧的一天、静默进今天。
-  // session.mode / chat_count_today 自本版起不读不写(字段留在 data.json 兼容老数据)。
+  // 跨天处理(契约 v1.2): 一天的边界=凌晨 dayStartHour 点, 滚动宽限期(graceMinutes)退役——
+  // 凌晨 1 点新开一段也算前一晚, 规则一句话讲得清。
+  // session.mode / chat_count_today 自 0.3.0 起不读不写(字段留在 data.json 兼容老数据)。
   async _loadOrReset() {
     const s = this.session;
-    const today = todayStr();
+    const today = logicalTodayStr();
     if (!s.entered_date) { s.entered_date = today; return {}; }
     if (s.entered_date === today) return {};
-    // 深夜宽限: 昨晚开始写、过零点半小时内继续说, 仍算前一晚
-    const gap = Date.now() - (s.last_activity_ts || 0);
-    const wasYesterday = s.entered_date === yesterdayStr();
-    const cfg = Number(this.plugin.settings.graceMinutes);
-    const graceMs = (cfg > 0 ? cfg : 30) * 60000;
-    if (wasYesterday && gap <= graceMs) return { graceDate: s.entered_date };
-    // 宽限期外: 自动封存旧的一天(空文件返回 false 无副作用), 真封了才告知
+    // 逻辑日翻页: 自动封存旧的一天(空文件返回 false 无副作用), 真封了才告知
     const sealed = await this.writer.finalizeDay(s.entered_date);
     s.entered_date = today;
     return sealed ? { expiredNotice: GRACE_EXPIRED_NOTICE } : {};
@@ -3407,7 +3449,7 @@ class DiaryAgent {
     }
     if (!ok) return diskFull ? IMAGE_DISK_FULL_REPLY : IMAGE_FAIL_REPLY;
     let reply = imageWrittenReply(lastN);
-    if (lastN === 1) reply = FIRST_OF_DAY_PREFIX + reply;
+    if (lastN === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
     if (failed) reply = IMAGE_PARTIAL_TEMPLATE.split("{n}").join(String(failed)) + "\n\n" + reply;
     return reply;
   }
@@ -3418,31 +3460,30 @@ class DiaryAgent {
     if (profile.state === "unknown" || !profile.state) {
       // 头一句就发图: 图先收下(内容优先), 再自我介绍
       profile.state = "awaiting_name";
-      const imgReply = await this._writeImages(images, cross.graceDate || undefined);
-      return imgReply + "\n\n" + WELCOME_TEXT;
+      const imgReply = await this._writeImages(images);
+      return imgReply + "\n\n" + this._welcome();
     }
-    return this._writeImages(images, cross.graceDate || undefined);
+    return this._writeImages(images);
   }
 
   // 主业务路由(v0.3.0 单模式: 发什么记什么, 命令词是唯一例外; 闲聊分支整体退役)
   async _handle(text, isVoice, cross) {
     const det = detectIntent(text);
-    const writeDate = cross.graceDate || undefined;
 
     if (det.intent === INTENT.HELP) return HELP_TEXT;
 
     // 探活(在吗/hello/测试…): 回状态, 不落库。用户在 ping"它还在吗"——尊重这个机制,
     // 别把它记进笔记。bot 不在线时本来就没人回, 有回复即是答案。
-    if (det.intent === INTENT.CHAT) return pingReply(await this.writer.countDay(writeDate));
+    if (det.intent === INTENT.CHAT) return pingReply(await this.writer.countDay());
 
     if (det.intent === INTENT.UNDO) {
-      const ok = await this.writer.undoLastBlock(writeDate);
-      return ok ? UNDO_OK_REPLY : UNDO_EMPTY_REPLY;
+      const r = await this.writer.undoLastBlock();
+      return r.ok ? undoOkReply(r.removed) : UNDO_EMPTY_REPLY;
     }
 
     if (det.intent === INTENT.FINALIZE) {
       // 封存降级为可选仪式: 写收尾标记, 不再切换任何模式; 之后继续发照样记
-      const ok = await this.writer.finalizeDay(writeDate);
+      const ok = await this.writer.finalizeDay();
       if (!ok) return FINALIZE_EMPTY_REPLY;
       return randomClosing(this.profile.name || null);
     }
@@ -3450,7 +3491,7 @@ class DiaryAgent {
     if (det.intent === INTENT.START_DIARY) {
       // 老习惯兼容: 短句只告知"不用了"; 长句(suspect)里是内容, 整句照记不能丢
       if (det.suspect) {
-        const writeReply = await this._writeEntry(text, isVoice, writeDate);
+        const writeReply = await this._writeEntry(text, isVoice);
         return writeReply + "\n\n" + START_DIARY_SUSPECT_NOTE;
       }
       const inlineName = extractExplicitName(text); // 「叫我小明, 开始记日记」别丢名字
@@ -3473,7 +3514,7 @@ class DiaryAgent {
       }
     }
 
-    return this._writeEntry(text, isVoice, writeDate);
+    return this._writeEntry(text, isVoice);
   }
 
   // 首次见面 + 取名"一轮即过"(v0.3.0)。取名永不吞内容:
@@ -3491,9 +3532,9 @@ class DiaryAgent {
       if (detectIntent(text).intent === INTENT.DIARY) {
         // 第一句就是内容: 先记下(内容优先), 再自我介绍
         const writeReply = await this._handle(text, isVoice, cross);
-        reply = (writeReply ? writeReply + "\n\n" : "") + WELCOME_TEXT;
+        reply = (writeReply ? writeReply + "\n\n" : "") + this._welcome();
       } else {
-        reply = WELCOME_TEXT; // 第一句是探活/命令: 欢迎语本身就是回答
+        reply = this._welcome(); // 第一句是探活/命令: 欢迎语本身就是回答
       }
     } else if (profile.state === "awaiting_name") {
       const det = detectIntent(text);
@@ -3523,11 +3564,14 @@ class DiaryAgent {
     // 图文同条: 微信通常拆成两条发, 但协议允许一条里既有 text 又有 image。
     // 文字先按原路走完(可能是命令), 图永远照收。
     if (hasText && images.length) {
-      const imgReply = await this._writeImages(images, cross.graceDate || undefined);
+      const imgReply = await this._writeImages(images);
       reply = reply ? reply + "\n\n" + imgReply : imgReply;
     }
 
-    if (reply && cross.expiredNotice) reply = cross.expiredNotice + "\n\n" + reply; // 告知在前(§3.3)
+    if (reply && cross.expiredNotice) {
+      // 跨天告知与「今天第一条」语义重复, 只留前者(告知在前, §3.3)
+      reply = cross.expiredNotice + "\n\n" + reply.replace(FIRST_OF_DAY_PREFIX, "");
+    }
     return reply;
   }
 
@@ -3925,6 +3969,7 @@ class WechatDiaryPlugin extends Plugin {
     };
     this.settings = this.data.settings;
     setTimezone(this.settings.timezone);
+    setDayStartHour(this.settings.dayStartHour);
 
     // data.json 丢了但 token 还在(卸载重装/同步盘回滚)时, 从 secret 里把身份取回来。
     // 顺序在 setTimezone 之后、管道启动之前, 让后面所有判断看到的都是补全过的状态。
@@ -3972,7 +4017,7 @@ class WechatDiaryPlugin extends Plugin {
       id: "open-today-note",
       name: "打开今天的日记",
       callback: () => {
-        const path = this.writer.diaryPath(todayStr());
+        const path = this.writer.diaryPath(logicalTodayStr());
         this.app.workspace.openLinkText(path, "", false);
       },
     });
@@ -4207,7 +4252,7 @@ class WechatDiaryPlugin extends Plugin {
     if (!ts) return null;
     const gapH = (Date.now() - ts) / 3600000;
     if (gapH < OFFLINE_NOTICE_GAP_H) return null;
-    return "(小提示: 我离线了大约 " + Math.floor(gapH) + " 小时, 期间你发的消息我可能没收到, " +
+    return "(小提示: 我离线超过一天了(约 " + Math.floor(gapH) + " 小时), 太早的消息可能没补到, " +
       "翻一下聊天记录, 漏了的可以再发我一次)";
   }
 
@@ -4364,8 +4409,8 @@ WechatDiaryPlugin.__internals = {
   todayStr, hhmmStr, weekdayForDate, yesterdayStr, setTimezone,
   ILinkClient, respCode,
   parseImageAesKey, sniffImageExt, decryptAesEcb,
-  INTENT, texts: { WELCOME_TEXT, HELP_TEXT },
-  pingReply,
+  INTENT, texts: { HELP_TEXT },
+  pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow,
 };
 
 module.exports = WechatDiaryPlugin;
