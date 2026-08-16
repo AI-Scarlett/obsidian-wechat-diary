@@ -1,45 +1,47 @@
-# WeChat Diary · 微信随手记
+# 微信随手记 (WeChat Diary)
 
-**Send anything to WeChat — it lands in your Obsidian vault as daily Markdown notes.**
+**对着微信说话, 内容自动落进你自己电脑的 Obsidian 库。**
 
-WeChat is the highest-frequency input box in a Chinese-speaking user's day. This plugin turns it into a zero-friction capture pipeline: scan a QR code once to bind a WeChat bot, then send text, voice, or photos to it from your phone anytime. While Obsidian is open on your desktop, every message is appended to `Diary/YYYY/YYYY-MM-DD.md` in your vault — plain Markdown, entirely on your machine.
+微信是中文用户一天里打开最频繁的输入框。这个插件把它变成一条零摩擦的采集管道: 扫码绑定一次微信 bot, 之后随时在手机上发文字、语音、图片给它——只要电脑上的 Obsidian 开着, 每条消息都会追加到库里的 `日记/YYYY/YYYY-MM-DD.md`。纯 Markdown, 全部在你自己的机器上。
 
-This is the Obsidian-plugin form of [wechat-diary](https://github.com/ArtemisLin/wechat-diary) (Python). Both implementations write byte-identical files under the same [data contract](docs/data-contract.md), so you can switch between them at any time.
+日记、备忘录、灵感、给爸妈记的病历——发出去, 就记下了。
 
-## Features
+## 功能
 
-- **Zero ceremony**: everything you send is recorded — no mode to enter, no magic words. Commands: 「撤回」 undo last entry, 「结束」 optional sealing footnote, 「帮助」 help. Greetings like 「在吗」 get a status reply instead of being recorded.
-- **Voice friendly**: WeChat transcribes voice messages for you; they arrive as text with a 🎤 mark.
-- **Photos**: send a picture and it is decrypted from WeChat's CDN, saved into `Diary/attachments/YYYY/`, and embedded in the day's note. 「撤回」 undoes a photo too.
-- **No AI involved**: raw text is stored exactly as you sent it — a purely mechanical, predictable pipeline. (AI settings are kept for a future opt-in feature but are currently inactive.)
-- **Data sovereignty**: notes are plain Markdown in your vault. No cloud service of ours, no account with us, no telemetry.
-- **Append-only and atomic**: history paragraphs are never rewritten; frontmatter is stable; the format is a documented contract any agent can read.
+- **发什么记什么, 不用任何开场白**: 不需要说「开始记日记」, 发出去就记下了。「撤回」删掉最后一条, 「结束」是可选的收尾仪式(不发也没关系, 跨天自动收尾), 「帮助」看全部用法。
+- **「在吗」会得到状态回复**: 打招呼、探活这类消息不会被记进笔记, bot 会告诉你它在、今天已记几段。
+- **熬夜不怕跨天**: 凌晨 4 点前记的都算前一天, 睡前的话属于"今晚"。
+- **语音友好**: 语音消息由微信自动转写成文字, 带 🎤 标记入库。
+- **图片**: 发图自动存进 `日记/attachments/YYYY/` 并嵌入当天笔记;「撤回」同样撤得掉(只删笔记里的引用, 图片文件保留)。
+- **纯机械记录, 不经过任何 AI**: 原文直存, 一个字不改, 行为完全可预测。(设置里的 AI 配置暂未启用, 为将来的可选功能保留。)
+- **数据只在你机器上**: 笔记是库里的纯 Markdown; 无作者服务器、无账号体系、无遥测。
+- **只追加, 格式公开**: 历史段落永不被改写, 写入格式是一份公开契约([docs/data-contract.md](docs/data-contract.md)), 任何工具和 AI 都能读。
 
-## Setup
+## 安装与绑定
 
-1. Install and enable the plugin (desktop only).
-2. Open plugin settings → **扫码绑定** → scan the QR code with WeChat on your phone and confirm.
-3. Pick the diary folder (default `日记`). Done — send the bot a message.
+1. 在 Obsidian 第三方插件里安装并启用(仅桌面端)。
+2. 打开插件设置 → **扫码绑定** → 用手机微信扫码并确认。
+3. 选好日记文件夹(默认 `日记`), 完事——给 bot 发条消息试试。
 
-## Honest limitations
+## 诚实的限制
 
-- **Desktop only, and the pipeline runs only while Obsidian is running.** Messages sent while your computer is off or asleep are fetched later via the server-side cursor when Obsidian comes back — offline gaps of up to 24 hours have been verified to backfill; longer gaps are untested.
-- Voice messages rely on WeChat's own transcription; when transcription fails the bot asks you to repeat.
-- Scheduled reminders from the Python version are not in this release yet.
+- **仅桌面端, 且管道只在 Obsidian 开着时运行。** 电脑关机/睡眠期间发的消息不会丢: 下次打开 Obsidian 会按服务端游标自动补记, **24 小时内实测可补收**, 更长时间未测。
+- 语音转写依赖微信自身; 转写失败时 bot 会请你重说一遍。
+- Python 版的定时提醒功能本版尚未包含。
 
-## Network use disclosure
+## 网络访问说明
 
-This plugin talks to exactly two kinds of remote services:
+本插件只与两类远程服务通信:
 
-1. **Tencent iLink bot API** (`ilinkai.weixin.qq.com`, plus the base URL that service assigns after login; QR pages are served from Tencent domains). This is the official WeChat bot channel — the plugin logs in by QR scan, long-polls for the messages you send to your bot, and sends replies back. Your messages necessarily transit WeChat/Tencent infrastructure, exactly as any WeChat message does. Connections to this API are made directly (bypassing system proxy) because the endpoint rejects proxied TLS in practice.
-2. **An OpenAI-compatible LLM endpoint that you configure yourself** — currently inactive: the present version never sends LLM traffic, even if configured. The settings exist for a future opt-in feature.
+1. **腾讯 iLink bot 接口**(`ilinkai.weixin.qq.com` 及登录后服务端指派的地址; 二维码页面由腾讯域名提供)。这是微信官方的 bot 通道——插件扫码登录、长轮询拉取你发给 bot 的消息、回发回执。你的消息本来就经过微信/腾讯的基础设施, 与任何微信消息相同。对该接口的连接为直连(绕过系统代理), 因为该端点实际上拒绝代理 TLS。
+2. **你自己配置的 OpenAI 兼容接口**——当前版本**未启用**: 即使配置了也不会发出任何 LLM 请求。设置项为将来的可选功能保留。
 
-No other network requests are made. There is no telemetry, no analytics, and no server operated by the plugin author. A WeChat account is required (that's the point of the plugin). The bot binding token and your AI key are stored in Obsidian's SecretStorage — outside the vault folder, so sync tools never pick them up; sync progress and non-secret state live in the plugin's `data.json`.
+除此之外没有任何网络请求。无遥测、无统计、无作者运营的服务器。使用本插件需要一个微信账号(这正是插件的意义所在)。bot 绑定凭据与 AI Key 存放在 Obsidian 的密钥存储中——在库文件夹之外, 同步工具不会带走它们; 同步进度等非敏感状态存于插件的 `data.json`。
 
-## Data format
+## 数据格式
 
 ```
-Diary/
+日记/
 ├── 2026/
 │   └── 2026-08-12.md
 └── attachments/
@@ -60,26 +62,12 @@ source: wechat-diary
 
 今天试了新的手冲豆子, 花香很明显。
 
-![[Diary/attachments/2026/2026-08-12-2305-a3f1.jpg]]
+![[日记/attachments/2026/2026-08-12-2305-a3f1.jpg]]
 ```
 
-Full rules in [docs/data-contract.md](docs/data-contract.md): append-only, Beijing-time dates (timezone configurable), one `\n\n`-separated block per message, sealing footnote on 「结束」. Since v1.2 the day boundary is 4 AM — entries before 4 AM land in the previous day's file (night owls rejoice).
+完整规则见 [docs/data-contract.md](docs/data-contract.md): 只追加、北京时间(时区可配)、一次发送 = 一个 `\n\n` 分隔块 = 一条消息、「结束」写封存注脚。自契约 v1.2 起, 一天的边界是凌晨 4 点——4 点前的记录落在前一天的文件里。
 
----
-
-## 中文说明
-
-对着微信说话, 日记自动落进你自己电脑的 Obsidian 库。
-
-- 设置里扫码绑定一次, 之后手机上任何时刻发文字/语音/图片给 bot, Obsidian 开着就会写进 `日记/YYYY/YYYY-MM-DD.md`。
-- **发什么记什么, 不用任何开场白**——不用再说「开始记日记」了。「撤回」删掉最后一条, 「结束」是可选的收尾仪式(不发也没关系, 跨天自动收尾), 「帮助」看全部命令。「在吗」这类打招呼会得到状态回复, 不会被记进笔记。
-- **熬夜不怕跨天**: 凌晨 4 点前记的都算前一天, 睡前的话属于"今晚"。
-- 发图: 图片存进 `日记/attachments/YYYY/`, 笔记里插 `![[...]]`;「撤回」同样撤得掉(只删引用, 图片文件保留)。
-- **纯机械记录, 不经过任何 AI**——原文直存, 一个字不改。(设置里的 AI 配置暂未启用, 为将来的可选功能保留。)
-- 数据只在你机器上: 凭据存 Obsidian 密钥存储, 不进 vault、不被同步盘带走; 无遥测、无作者服务器。
-- 与 Python 版 [wechat-diary](https://github.com/ArtemisLin/wechat-diary) 产出的文件逐字节一致, 两边随时互迁。
-
-**诚实的限制**: 仅桌面端; Obsidian 关着时管道即停, 重开后按服务端游标补拉离线期间的消息(24 小时内已实测可补收, 更长未测)。
+与 Python 版 [wechat-diary](https://github.com/ArtemisLin/wechat-diary) 产出的文件遵循同一契约, 两种形态可随时互迁。
 
 ## License
 
