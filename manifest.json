@@ -1,7 +1,7 @@
 {
   "id": "wechat-diary",
   "name": "WeChat Diary",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "minAppVersion": "1.11.4",
   "description": "Capture diary entries and quick notes by chatting to a WeChat bot. Text, voice, and photos land in your vault as daily Markdown files.",
   "author": "GuYu",

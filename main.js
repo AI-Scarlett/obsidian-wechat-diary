@@ -2317,7 +2317,7 @@ var qrcode = function() {
 
 const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform, AbstractInputSuggest } = require("obsidian");
 
-const PLUGIN_VERSION = "0.2.1";
+const PLUGIN_VERSION = "0.3.0";
 const AGENT_NAME = "obsidian-wechat-diary";
 const BOT_AGENT = AGENT_NAME + "/" + PLUGIN_VERSION;
 const CHANNEL_VERSION = "2.4.6";               // 对齐官方 @tencent-weixin/openclaw-weixin
@@ -2343,7 +2343,6 @@ const QR_LOCAL_TTL_MS = 5 * 60 * 1000;         // 单张二维码本地 TTL(同�
 const STALE_TOKEN_ERRCODE = -14;
 const SESSION_PAUSE_MS = 60 * 60 * 1000;       // -14 冷却整 1 小时, 同官方
 const MAX_RECENT_SEQS = 200;
-const NUDGE_EVERY = 4;                         // 每 4 段追加一次劝收尾
 const OFFLINE_NOTICE_GAP_H = 12;
 
 const DEFAULT_SETTINGS = {
@@ -2399,72 +2398,47 @@ function randHex(n) {
   return s;
 }
 
-// ── 文案资产(019 welcome.py 逐字搬运; 标【宿主适配】处为唯一改动)──────
+// ── 文案资产(v0.3.0 单模式全面改写; 019 双模式文案退役)─────────────────
 
-const WELCOME_TEXT = `嗨~ 我是你的日记 Agent 📖
+const WELCOME_TEXT = `嗨~ 我是你的随手记 Agent ✍️
 
-我有两种模式:
-• 平时陪你随便聊聊 (闲聊模式)
-• 你说「开始记日记」就进入记录模式, 之后说什么我都帮你记到今天的笔记里
-• 完了发「结束」收尾归档
+想记什么直接发给我, 文字、语音、图片都行, 我会记到你今天的笔记里。
+说错了发「撤回」, 随时发「帮助」看全部用法。
 
-随时发「帮助」看完整命令。
+第一次见面, 你希望我叫你什么名字呢? (不想要称呼就发「跳过」)`;
 
-第一次见面, 你希望我叫你什么名字呢?
-(直接发名字就行, 比如「谷雨」; 也可以说「叫我XX」; 不想要称呼就发「跳过」)`;
-
-const NAME_CONFIRM_TEMPLATE = "好的{name}~ 以后我们一起记日记吧 😊\n想说什么直接发, 或发「开始记日记」开始今天的记录";
-const NAME_UNCLEAR_HINT = "没太看出来名字呢~ 名字短一点直接发就行, 比如「谷雨」, 再发一次? 不想要称呼就发「跳过」";
-const STILL_AWAITING_NAME_HINT = "(对了, 还没告诉我怎么称呼你呢~ 直接发名字就行, 比如「谷雨」; 不想要就发「跳过」)";
-const NAME_SKIPPED_REPLY = "好的~ 那就不特别称呼啦 😊 想记今天的话, 发「开始记日记」就开始; 以后想让我称呼你, 随时发「叫我XX」";
-const NAME_LATER_HINT = "(名字不急~ 记完发「结束」之后, 随时发「叫我XX」告诉我就行)";
+const NAME_CONFIRM_TEMPLATE = "好的{name}~ 想记什么直接发我就行 ✍️";
+const NAME_SKIPPED_REPLY = "好的~ 那就不特别称呼啦 😊 想记什么直接发就行; 以后想让我称呼你, 随时发「叫我XX」";
+const NAME_LATER_HINT = "(称呼不急~ 想要的话随时发「叫我XX」)";
 const NAME_INLINE_CONFIRM_TEMPLATE = "(称呼记下啦, {name}~)";
 const RENAME_CONFIRM_TEMPLATE = "好嘞{name}~ 以后就这么叫你啦 😊";
 const NAME_MAX_LEN = 10;
 
-// 【宿主适配】末两行: 插件 v0.1 无定时提醒; 跨天行为按宽限期修复后的实际行为描述
-const HELP_TEXT = `📖 日记 Agent 使用指南
+// 单模式使用指南。末段把"关着也不丢"讲给用户(缓冲窗口 24h 实测, 2026-08-16)
+const HELP_TEXT = `✍️ 微信随手记 使用指南
 
-【两种模式】
-• 闲聊模式 (默认): 随便聊, 不写日记
-• 记录模式: 你说的话都会写进今天的笔记
+想记什么直接发, 文字、语音、图片都行, 自动记到今天的笔记里。
+不用任何开场白, 发出去就记下了。
 
-【模式切换】
-• 进入记录: 发「开始记日记」/「记日记」/「开始」
-• 退出记录: 发「结束」(同时归档今天)
-
-【命令 (两种模式都能用)】
+【命令】
+• 撤回 → 删掉刚记的最后一条
+• 结束 → 给今天写个收尾标记 (不发也没关系, 跨天会自动收尾)
+• 叫我XX → 设置/修改你的称呼
 • 帮助 → 看到这条
-• 撤回 → 删掉刚才记的最后一段 (仅记录模式)
-• 叫我XX → 设置/修改你的称呼 (闲聊模式下)
 
-【图片】
-记录模式下直接发图, 图会存进库里并插进今天的笔记;
-「撤回」同样能撤掉刚发的图。
+深夜过了零点也不怕, 半小时内继续说仍算前一晚。
+Obsidian 没开着也能发, 24 小时内下次打开会自动补记。`;
 
-跨天会自动回到闲聊模式 (避免新一天的话被记到昨天);
-深夜写着写着过了零点也不怕, 半小时内继续说仍算前一晚。`;
-
-const ENTER_DIARY_REPLIES = [
-  "好的~ 开始记今天的日记 📖 想说什么直接说就行, 完了发「结束」收尾",
-  "记录模式开启 ✍️ 接下来你说的都会写进今天的笔记",
-  "好嘞, 我洗耳恭听 📖 完了记得说「结束」让我归档",
-];
-
-const CHAT_COST_REMINDER = "\n\n💡 闲聊会消耗一点 token~ 我主要是帮你记日记的, 想记今天的话发「开始记日记」就开始 📖";
-
-const NOT_IN_DIARY_HINTS = {
-  undo: "现在是闲聊模式哦, 还没开始记呢, 没东西可撤~ 想记的话发「开始记日记」",
-  finalize: "现在是闲聊模式, 还没开始记呢~ 想记的话发「开始记日记」",
-};
+// 老用户习惯发「开始记日记」: 友好告知不用了, 不落库
+const START_DIARY_OBSOLETE_REPLY = "现在不用特意开始啦~ 想记什么直接发就行 ✍️";
+const START_DIARY_SUSPECT_NOTE = "(顺便说, 现在不用发「开始记日记」了, 直接说就记)";
 
 // 图片相关文案
-const IMAGE_NOT_IN_DIARY_HINT = "图片我先没收进日记~ 现在是闲聊模式, 发「开始记日记」再发图, 我就帮你收进今天的小册子 📷";
 const IMAGE_FAIL_REPLY = "这张图没存下来 😢 网络或格式的问题, 要不重发一次?";
 const IMAGE_DISK_FULL_REPLY = "存图片失败! 磁盘可能满了 💾 请检查磁盘空间";
 const IMAGE_PARTIAL_TEMPLATE = "(有 {n} 张没存下来, 可以重发一次)";
 function imageWrittenReply(n) {
-  return "📷 图片收好啦~ 这是今天第 " + n + " 段 ✍️\n继续说; 记错了发「撤回」, 说完了发「结束」";
+  return "📷 图片收好啦~ 今天第 " + n + " 段 ✍️";
 }
 
 const CLOSING_LINES = [
@@ -2486,28 +2460,21 @@ const CLOSING_LINES_WITH_NAME = [
   "{name}, 这一页属于今天, 收好了 📖",
 ];
 
-const NUDGE_TEXT = "差不多了? 还有吗? 没有就发「结束」, 我帮你收进今天的小册子。";
+// 探活回执(替代闲聊模式的问候回复): 回状态, 不落库。
+// 「在吗」是用户自己发明的 ping——有回复=在线; 尊重它, 别把它记进笔记。
+function pingReply(n) {
+  if (n > 0) return "在的~ 今天已记 " + n + " 段 ✍️ 想记什么直接发";
+  return "在的~ 想记什么直接发, 我都记着 ✍️";
+}
 
-const CHAT_GREETING_REPLIES = [
-  "嗨~ 我在呢 😊 想说点什么?",
-  "在的在的, 今天过得怎么样?",
-  "嗨~ 来啦? 想到什么直接说就好",
-  "我在呢, 慢慢说我都听着",
-  "嗨~ 准备好开聊了吗?",
-];
-
-// 【宿主适配】第三条: .env 概念改为插件设置面板
-const NO_KEY_CHAT_REPLIES = [
-  "我在呢~ 不过我的主业是帮你记日记 📖 发「开始记日记」就开始",
-  "嗯嗯我听着~ 想记下来的话, 发「开始记日记」就好",
-  "我在~ 陪聊需要在插件设置里配好 AI 接口才能开启; 记日记不用, 发「开始记日记」就行",
-];
+// 每天第一条的回执前缀: 零动作给足"它在且在记"的信任信号
+const FIRST_OF_DAY_PREFIX = "今天第一条, 已开新的一页 📖\n";
 
 const UNDO_OK_REPLY = "好的, 帮你撤回啦";
 const UNDO_EMPTY_REPLY = "今天还什么都没说呢, 没东西可撤哦";
-const FINALIZE_EMPTY_REPLY = "今天还没说话呢, 要不先说两句吧?";
-// 020 新文案: 宽限期外跨天, 昨天已自动封存的告知(019 无此文案, 修「午夜割裂静默吃话」)
-const GRACE_EXPIRED_NOTICE = "(对了, 昨天的记录我帮你封存好啦~ 新的一天想记的话, 发「开始记日记」重新开始)";
+const FINALIZE_EMPTY_REPLY = "今天还没记东西呢~ 想记什么直接发";
+// 宽限期外跨天: 昨天已自动封存的告知(单模式: 新一天直接继续记, 无需任何动作)
+const GRACE_EXPIRED_NOTICE = "(昨天的记录我帮你自动收尾啦~ 现在说的会记到今天)";
 
 function randomClosing(name) {
   let head;
@@ -2524,11 +2491,13 @@ const MAX_COMMAND_LEN = 15;
 const FINALIZE_KEYWORDS = new Set(["结束", "收尾", "收工", "打烊", "归档", "完了"]);
 const UNDO_KEYWORDS = new Set(["撤回", "删掉", "删除", "撤销", "删掉上一段", "删掉上条", "撤回上一段"]);
 const HELP_KEYWORDS = new Set(["/help", "help", "帮助", "怎么用", "使用说明", "菜单"]);
+// 探活/寒暄词表: 这些是 ping, 不是内容——回状态、不落库(v0.3.0 单模式下的关键闸门)
 const CHAT_GREETING_KEYWORDS = new Set([
-  "你好", "您好", "嗨", "hi", "hello", "hihi", "halo",
-  "在吗", "在么", "在不在", "在嘛", "喂",
+  "你好", "您好", "嗨", "hi", "hello", "hihi", "halo", "哈喽", "哈罗",
+  "在吗", "在么", "在不在", "在嘛", "你在吗", "你在么", "你在不在", "喂",
   "我来啦", "我来了", "来啦", "我来",
   "早", "早安", "早上好", "中午好", "下午好", "晚上好",
+  "测试", "test", "试试", "试一下",
 ]);
 const START_DIARY_KEYWORDS = new Set([
   "开始记日记", "开始记录", "记日记", "开始", "开始写",
@@ -2581,7 +2550,8 @@ function detectIntent(text) {
   if (norm.startsWith("撤回") || norm.startsWith("撤销")) return { intent: INTENT.UNDO };
   if (HELP_KEYWORDS.has(norm)) return { intent: INTENT.HELP };
   if (START_DIARY_KEYWORDS.has(norm)) return { intent: INTENT.START_DIARY };
-  if (CHAT_GREETING_KEYWORDS.has(norm)) return { intent: INTENT.CHAT };
+  // 探活判定连复读一起认(「在吗在吗」→「在吗」): 微信急性子用户的高频形态
+  if (CHAT_GREETING_KEYWORDS.has(norm) || CHAT_GREETING_KEYWORDS.has(foldRepeats(norm))) return { intent: INTENT.CHAT };
   return { intent: INTENT.DIARY };
 }
 
@@ -2853,12 +2823,13 @@ class AiClient {
   }
 }
 
-// 闲聊(带 5 轮内存历史, 不持久化)
+// 闲聊(带 5 轮内存历史, 不持久化)。
+// ⚠️ v0.3.0 起单模式不再有调用点——代码按谷雨要求保留, 待"AI 怎么融进 Agent"想清楚再启用。
 class ChatHandler {
   constructor(ai) { this.ai = ai; this.history = []; }
   resetHistory() { this.history = []; }
   async chat(text) {
-    if (!this.ai.ready()) return randomChoice(NO_KEY_CHAT_REPLIES);
+    if (!this.ai.ready()) return "想记什么直接发就行 ✍️";
     const messages = [{ role: "system", content: CHAT_SYSTEM_PROMPT }, ...this.history, { role: "user", content: text }];
     let reply;
     try {
@@ -2962,14 +2933,15 @@ class DiaryWriter {
   }
 
   // 写一条。返回 { reply, n }。永不抛。
+  // v0.3.0: 不再调 AI 润色, 原文直存——备忘录定位下润色是风险(病例数字被"润"了怎么办),
+  // AiClient.polish 代码保留, 待润色作为显式开关回归时再接。
   async write(text, isVoice, dateStr) {
     text = (text || "").trim();
     if (!text) return { reply: "嗯? 没听清, 再说一次?", n: 0 };
     const day = dateStr || todayStr();
 
-    const { text: polishedRaw, usedLlm, kind } = await this.ai.polish(text);
     // 契约规则 6: 块内空行收敛为单个换行, 一次发送 = 一个块 = 一条消息
-    let polished = polishedRaw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(NORMALIZE_BLANK_RE, "\n").trim();
+    let polished = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(NORMALIZE_BLANK_RE, "\n").trim();
     if (isVoice) polished = "🎤 " + polished;
     else if (polished.startsWith("# ") || polished.startsWith("---") || polished.startsWith("_(")) {
       // 首行撞契约排除前缀会让整块"隐形"(不计数、undo 误删更早内容), 反斜杠转义
@@ -2989,10 +2961,20 @@ class DiaryWriter {
 
     const n = countMessages(finalContent);
     const voiceMark = isVoice ? "🎤 " : "";
-    const netNote = usedLlm ? "" : (kind == null ? "" : (NET_NOTE_BY_KIND[kind] || NET_NOTE_BY_KIND.other));
-    const reply = voiceMark + "嗯, 记下来啦~ 这是今天第 " + n + " 段 ✍️" + netNote +
-      "\n继续说; 记错了发「撤回」, 说完了发「结束」";
+    let reply = voiceMark + "记下来啦~ 今天第 " + n + " 段 ✍️";
+    if (n === 1) reply = FIRST_OF_DAY_PREFIX + reply;
     return { reply, n };
+  }
+
+  // 数今天(或指定日)已记的段数; 探活回执用。读不到按 0 算, 永不抛。
+  async countDay(dateStr) {
+    try {
+      const vault = this.plugin.app.vault;
+      const path = this.diaryPath(dateStr || todayStr());
+      const file = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
+      if (!file) return 0;
+      return countMessages(await vault.cachedRead(file));
+    } catch (e) { return 0; }
   }
 
   // 存一张图: 落进 vault 附件目录, 日记里插一个 ![[]] 块。
@@ -3378,48 +3360,32 @@ class DiaryAgent {
 
   // 跨天处理(020「午夜割裂」修复: 宽限期 + 显式告知)。
   // 返回 { graceDate?: string, expiredNotice?: string }
+  // 跨天处理(v0.3.0 单模式): 宽限期内仍算前一晚; 过期自动封存旧的一天、静默进今天。
+  // session.mode / chat_count_today 自本版起不读不写(字段留在 data.json 兼容老数据)。
   async _loadOrReset() {
     const s = this.session;
     const today = todayStr();
-    if (!s.entered_date) {
-      Object.assign(s, { mode: "chat", entered_date: today, chat_count_today: 0 });
-      return {};
-    }
+    if (!s.entered_date) { s.entered_date = today; return {}; }
     if (s.entered_date === today) return {};
-    if (s.mode === "diary") {
-      const gap = Date.now() - (s.last_activity_ts || 0);
-      const wasYesterday = s.entered_date === yesterdayStr();
-      const cfg = Number(this.plugin.settings.graceMinutes);
-      const graceMs = (cfg > 0 ? cfg : 30) * 60000;
-      if (wasYesterday && gap <= graceMs) {
-        return { graceDate: s.entered_date }; // 同一晚的延续, 保持 diary 模式
-      }
-      const oldDate = s.entered_date;
-      await this.writer.finalizeDay(oldDate); // 自动封存, 封存注脚用当前时间
-      Object.assign(s, { mode: "chat", entered_date: today, chat_count_today: 0 });
-      return { expiredNotice: GRACE_EXPIRED_NOTICE };
-    }
-    Object.assign(s, { mode: "chat", entered_date: today, chat_count_today: 0 }); // chat 跨天静默重置
-    return {};
-  }
-
-  _enterDiary() {
-    Object.assign(this.session, { mode: "diary", entered_date: todayStr(), chat_count_today: 0, last_activity_ts: Date.now() });
-    this.chatHandler.resetHistory();
-  }
-
-  _exitDiary() {
-    Object.assign(this.session, { mode: "chat", entered_date: todayStr(), chat_count_today: 0 });
+    // 深夜宽限: 昨晚开始写、过零点半小时内继续说, 仍算前一晚
+    const gap = Date.now() - (s.last_activity_ts || 0);
+    const wasYesterday = s.entered_date === yesterdayStr();
+    const cfg = Number(this.plugin.settings.graceMinutes);
+    const graceMs = (cfg > 0 ? cfg : 30) * 60000;
+    if (wasYesterday && gap <= graceMs) return { graceDate: s.entered_date };
+    // 宽限期外: 自动封存旧的一天(空文件返回 false 无副作用), 真封了才告知
+    const sealed = await this.writer.finalizeDay(s.entered_date);
+    s.entered_date = today;
+    return sealed ? { expiredNotice: GRACE_EXPIRED_NOTICE } : {};
   }
 
   async _writeEntry(text, isVoice, dateStr) {
     this.session.last_activity_ts = Date.now();
-    const { reply, n } = await this.writer.write(text, isVoice, dateStr);
-    if (n > 0 && n % NUDGE_EVERY === 0) return reply + "\n\n" + NUDGE_TEXT;
+    const { reply } = await this.writer.write(text, isVoice, dateStr);
     return reply;
   }
 
-  // 下载并写入一批图片(仅 diary 模式调用)。一张失败不连累其余。
+  // 下载并写入一批图片。一张失败不连累其余。
   async _writeImages(images, dateStr) {
     this.session.last_activity_ts = Date.now();
     const client = this.plugin._client;
@@ -3441,96 +3407,77 @@ class DiaryAgent {
     }
     if (!ok) return diskFull ? IMAGE_DISK_FULL_REPLY : IMAGE_FAIL_REPLY;
     let reply = imageWrittenReply(lastN);
+    if (lastN === 1) reply = FIRST_OF_DAY_PREFIX + reply;
     if (failed) reply = IMAGE_PARTIAL_TEMPLATE.split("{n}").join(String(failed)) + "\n\n" + reply;
-    if (lastN % NUDGE_EVERY === 0) reply += "\n\n" + NUDGE_TEXT;
     return reply;
   }
 
-  // 纯图片消息(微信发图就是单独一条, 不带文字)。不进文本状态机: 空文本喂进去只会得到"没听清"。
+  // 纯图片消息(微信发图就是单独一条, 不带文字)。单模式: 图永远照收, 不进文本状态机。
   async _handleImageOnly(images, cross) {
-    if (this.session.mode === "diary") {
-      // 内容优先: 还没取名的用户照收不误(同文本路径 _dispatch 的第一分支)
-      return this._writeImages(images, cross.graceDate || undefined);
-    }
     const profile = this.profile;
     if (profile.state === "unknown" || !profile.state) {
-      profile.state = "awaiting_name"; // 头一句就发图: 先自我介绍(文本首条同样不落库)
-      return WELCOME_TEXT;
+      // 头一句就发图: 图先收下(内容优先), 再自我介绍
+      profile.state = "awaiting_name";
+      const imgReply = await this._writeImages(images, cross.graceDate || undefined);
+      return imgReply + "\n\n" + WELCOME_TEXT;
     }
-    return IMAGE_NOT_IN_DIARY_HINT;
+    return this._writeImages(images, cross.graceDate || undefined);
   }
 
-  // 主业务路由(019 main.py _handle)
+  // 主业务路由(v0.3.0 单模式: 发什么记什么, 命令词是唯一例外; 闲聊分支整体退役)
   async _handle(text, isVoice, cross) {
-    const s = this.session;
     const det = detectIntent(text);
     const writeDate = cross.graceDate || undefined;
 
     if (det.intent === INTENT.HELP) return HELP_TEXT;
 
-    if (s.mode === "diary") {
-      if (det.intent === INTENT.UNDO) {
-        const ok = await this.writer.undoLastBlock(writeDate);
-        return ok ? UNDO_OK_REPLY : UNDO_EMPTY_REPLY;
-      }
-      if (det.intent === INTENT.FINALIZE) {
-        const ok = await this.writer.finalizeDay(writeDate);
-        if (!ok) return FINALIZE_EMPTY_REPLY;
-        this._exitDiary();
-        this.chatHandler.resetHistory();
-        const name = this.profile.name || null;
-        return randomClosing(name);
-      }
-      // diary 模式下其余所有意图都当日记记(再说"开始记日记"就当内容写入, 不重复进入)
-      return this._writeEntry(text, isVoice, writeDate);
+    // 探活(在吗/hello/测试…): 回状态, 不落库。用户在 ping"它还在吗"——尊重这个机制,
+    // 别把它记进笔记。bot 不在线时本来就没人回, 有回复即是答案。
+    if (det.intent === INTENT.CHAT) return pingReply(await this.writer.countDay(writeDate));
+
+    if (det.intent === INTENT.UNDO) {
+      const ok = await this.writer.undoLastBlock(writeDate);
+      return ok ? UNDO_OK_REPLY : UNDO_EMPTY_REPLY;
     }
 
-    // === CHAT 模式 ===
+    if (det.intent === INTENT.FINALIZE) {
+      // 封存降级为可选仪式: 写收尾标记, 不再切换任何模式; 之后继续发照样记
+      const ok = await this.writer.finalizeDay(writeDate);
+      if (!ok) return FINALIZE_EMPTY_REPLY;
+      return randomClosing(this.profile.name || null);
+    }
+
     if (det.intent === INTENT.START_DIARY) {
-      this._enterDiary();
-      let reply = randomChoice(ENTER_DIARY_REPLIES);
+      // 老习惯兼容: 短句只告知"不用了"; 长句(suspect)里是内容, 整句照记不能丢
       if (det.suspect) {
-        // 020 修复: 长句触发切换时整句作为第一条日记写入, 内容不丢; 误判可「撤回」
-        const writeReply = await this._writeEntry(text, isVoice);
-        return reply + "\n\n" + writeReply;
+        const writeReply = await this._writeEntry(text, isVoice, writeDate);
+        return writeReply + "\n\n" + START_DIARY_SUSPECT_NOTE;
       }
-      // 「叫我小明, 开始记日记」: 同句里的显式称呼别丢
-      const inlineName = extractExplicitName(text);
+      const inlineName = extractExplicitName(text); // 「叫我小明, 开始记日记」别丢名字
       if (inlineName) {
         this.profile.name = inlineName;
         this.profile.state = "active";
-        reply += "\n\n" + NAME_INLINE_CONFIRM_TEMPLATE.split("{name}").join(inlineName);
+        return START_DIARY_OBSOLETE_REPLY + "\n\n" + NAME_INLINE_CONFIRM_TEMPLATE.split("{name}").join(inlineName);
       }
-      return reply;
+      return START_DIARY_OBSOLETE_REPLY;
     }
 
-    if (det.intent === INTENT.UNDO) return NOT_IN_DIARY_HINTS.undo;
-    if (det.intent === INTENT.FINALIZE) return NOT_IN_DIARY_HINTS.finalize;
-
-    // 显式「叫我XX」→ 设置/修改称呼(仅 chat 模式; diary 模式照记不误)
-    const newName = extractExplicitName(text);
-    if (newName) {
-      this.profile.name = newName;
-      this.profile.state = "active";
-      return RENAME_CONFIRM_TEMPLATE.split("{name}").join(newName);
+    // 显式「叫我XX」短句 → 改称呼。只对命令长度的短句生效:
+    // 「叫我妈过来吃饭」这类以"叫我"开头的长句是内容, 必须照记(单模式新增的守卫)
+    if (codePointLen((text || "").trim()) <= MAX_COMMAND_LEN) {
+      const newName = extractExplicitName(text);
+      if (newName) {
+        this.profile.name = newName;
+        this.profile.state = "active";
+        return RENAME_CONFIRM_TEMPLATE.split("{name}").join(newName);
+      }
     }
 
-    let reply;
-    if (det.intent === INTENT.CHAT) reply = randomChoice(CHAT_GREETING_REPLIES);
-    else reply = await this.chatHandler.chat(text);
-
-    // 020 修复: 成本提示每天最多一次(019 从第 2 条起每条都追加, 太烦)
-    const s2 = this.session;
-    const today = todayStr();
-    s2.chat_count_today = (s2.chat_count_today || 0) + 1;
-    if (s2.chat_count_today === 2 && this.ai.ready() && s2.cost_reminder_shown_date !== today) {
-      s2.cost_reminder_shown_date = today;
-      reply += CHAT_COST_REMINDER;
-    }
-    return reply;
+    return this._writeEntry(text, isVoice, writeDate);
   }
 
-  // 首次见面欢迎 + 取名流程, 之后才走主路由(019 main.py _dispatch)
+  // 首次见面 + 取名"一轮即过"(v0.3.0)。取名永不吞内容:
+  // 认得出名字才当名字, 认不出=它是内容, 照记 + 提示称呼可后设; 只问这一轮, 不当拦路虎。
   async _dispatch(text, isVoice, images) {
     const cross = await this._loadOrReset();
     const profile = this.profile;
@@ -3539,55 +3486,43 @@ class DiaryAgent {
     let reply;
     if (!hasText && images.length) {
       reply = await this._handleImageOnly(images, cross);
-    } else if (profile.state !== "active" && this.session.mode === "diary") {
-      // 已在 diary 的非 active 用户: 内容优先, 取名流程不得吞日记
-      reply = await this._handle(text, isVoice, cross);
     } else if (profile.state === "unknown" || !profile.state) {
       profile.state = "awaiting_name";
-      reply = WELCOME_TEXT;
+      if (detectIntent(text).intent === INTENT.DIARY) {
+        // 第一句就是内容: 先记下(内容优先), 再自我介绍
+        const writeReply = await this._handle(text, isVoice, cross);
+        reply = (writeReply ? writeReply + "\n\n" : "") + WELCOME_TEXT;
+      } else {
+        reply = WELCOME_TEXT; // 第一句是探活/命令: 欢迎语本身就是回答
+      }
     } else if (profile.state === "awaiting_name") {
       const det = detectIntent(text);
-      if (det.intent === INTENT.HELP) {
-        reply = HELP_TEXT + "\n\n" + STILL_AWAITING_NAME_HINT;
-      } else if (det.intent === INTENT.CHAT) {
-        reply = randomChoice(CHAT_GREETING_REPLIES) + "\n\n" + STILL_AWAITING_NAME_HINT;
-      } else if (det.intent === INTENT.FINALIZE || det.intent === INTENT.UNDO) {
-        const key = det.intent === INTENT.UNDO ? "undo" : "finalize";
-        reply = NOT_IN_DIARY_HINTS[key] + "\n\n" + STILL_AWAITING_NAME_HINT;
-      } else if (det.intent === INTENT.START_DIARY) {
-        // 取名不拦路: 放行命令; 同句带名字先收下
-        const { name } = extractName(text);
-        if (name) { profile.name = name; }
-        profile.state = "active";
-        reply = await this._handle(text, isVoice, cross);
-        if (reply) {
-          const tail = name ? NAME_INLINE_CONFIRM_TEMPLATE.split("{name}").join(name) : NAME_LATER_HINT;
-          reply = reply + "\n\n" + tail;
-        }
-      } else {
+      if (det.intent === INTENT.DIARY) {
         const { name: extracted, refused } = extractName(text);
-        let name = extracted;
         if (refused) {
           profile.state = "active";
           reply = NAME_SKIPPED_REPLY;
+        } else if (extracted) {
+          profile.name = extracted;
+          profile.state = "active";
+          reply = NAME_CONFIRM_TEMPLATE.split("{name}").join(extracted);
         } else {
-          if (name == null && this.ai.ready()) name = await this.ai.llmExtractName(text);
-          if (name == null) {
-            reply = NAME_UNCLEAR_HINT;
-          } else {
-            profile.name = name;
-            profile.state = "active";
-            reply = NAME_CONFIRM_TEMPLATE.split("{name}").join(name);
-          }
+          profile.state = "active"; // 不像名字 → 它是内容, 记下; 取名只问一轮
+          reply = await this._handle(text, isVoice, cross);
+          if (reply) reply += "\n\n" + NAME_LATER_HINT;
         }
+      } else {
+        profile.state = "active"; // 命令照常执行, 取名放行不再纠缠
+        reply = await this._handle(text, isVoice, cross);
+        if (reply) reply += "\n\n" + NAME_LATER_HINT;
       }
     } else {
       reply = await this._handle(text, isVoice, cross);
     }
 
     // 图文同条: 微信通常拆成两条发, 但协议允许一条里既有 text 又有 image。
-    // 文字先按原路走完(可能刚好是「开始记日记」把模式切开), 图再按最终模式处理。
-    if (hasText && images.length && this.session.mode === "diary") {
+    // 文字先按原路走完(可能是命令), 图永远照收。
+    if (hasText && images.length) {
       const imgReply = await this._writeImages(images, cross.graceDate || undefined);
       reply = reply ? reply + "\n\n" + imgReply : imgReply;
     }
@@ -3935,10 +3870,10 @@ class WechatDiarySettingTab extends PluginSettingTab {
         }));
     }
 
-    new Setting(containerEl).setName("AI 润色与闲聊 (可选)").setHeading();
+    new Setting(containerEl).setName("AI (暂未启用)").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
-      text: "不配也完整可用: 原文直存, 闲聊走固定文案。配了以后写入前轻度润色、闲聊走大模型。",
+      text: "当前版本走纯机械记录, 不调用任何 AI——发什么原文存什么。这里的配置会保留, 将来 AI 功能回归时生效。",
     });
 
     new Setting(containerEl)
@@ -4130,14 +4065,17 @@ class WechatDiaryPlugin extends Plugin {
     this.setBotToken(botToken);
     const il = this.data.ilink;
     const sameUser = il.userId === userId;
+    // ⚠️ seq 不是全局 id, 是每个 bot 会话从 1 重数的计数器(8/13 实测踩坑):
+    // 同一微信号换了新 bot 时保留旧 recentSeqs/buf, 会把新 bot 的前 N 条消息
+    // 静默吞掉(当时哑了一整天)。游标和去重表必须按【bot】判, 不能只按微信号。
+    const sameBot = sameUser && il.botId === botId;
     Object.assign(il, {
       botId, userId, baseUrl,
       loginTime: new Date().toISOString(),
       pauseUntil: 0,
-      // 换了微信号绑定 = 换了主人: 同步进度和称呼各归各
-      buf: sameUser ? il.buf : "",
-      contextTokens: sameUser ? il.contextTokens : {},
-      recentSeqs: sameUser ? il.recentSeqs : [],
+      buf: sameBot ? il.buf : "",
+      contextTokens: sameBot ? il.contextTokens : {},   // context_token 也是 bot 会话级
+      recentSeqs: sameBot ? il.recentSeqs : [],
     });
     if (!sameUser) {
       this.data.profile = { state: "unknown", name: null };
@@ -4426,7 +4364,8 @@ WechatDiaryPlugin.__internals = {
   todayStr, hhmmStr, weekdayForDate, yesterdayStr, setTimezone,
   ILinkClient, respCode,
   parseImageAesKey, sniffImageExt, decryptAesEcb,
-  INTENT, texts: { WELCOME_TEXT, HELP_TEXT, NUDGE_TEXT },
+  INTENT, texts: { WELCOME_TEXT, HELP_TEXT },
+  pingReply,
 };
 
 module.exports = WechatDiaryPlugin;

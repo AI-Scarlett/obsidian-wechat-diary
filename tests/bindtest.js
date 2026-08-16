@@ -179,6 +179,91 @@ async function newPlugin(secrets, storedData) {
   await p10.unbind(false);
   check("彻底解除清干净", p10.getBotToken() === "");
 
+  // ══ v0.3.0 单模式路由 ═══════════════════════════════════════════════════
+
+  const BOUND_DATA = () => ({
+    settings: { diaryFolder: "日记", timezone: "Asia/Shanghai", aiApiUrl: "", aiModel: "", graceMinutes: 30 },
+    ilink: { botId: "B1", userId: "U1", baseUrl: "", buf: "", contextTokens: {}, recentSeqs: [], pauseUntil: 0, lastAliveTs: 0, loginTime: "x", botTokenFallback: "", skipBacklog: false },
+    profile: { state: "active", name: null },
+    session: { mode: "chat", entered_date: "", chat_count_today: 0, last_activity_ts: 0, cost_reminder_shown_date: "" },
+  });
+
+  // 桩掉 writer 的落盘方法(agent.writer 与 plugin.writer 同引用, 原地换方法即可)
+  function stubWriter(p) {
+    const calls = { writes: [], finalized: [] };
+    p.writer.write = async (text) => { calls.writes.push(text); return { reply: "记下来啦~ 今天第 " + calls.writes.length + " 段 ✍️", n: calls.writes.length }; };
+    p.writer.finalizeDay = async (d) => { calls.finalized.push(d || "today"); return calls.writes.length > 0; };
+    p.writer.undoLastBlock = async () => (calls.writes.length ? (calls.writes.pop(), true) : false);
+    p.writer.countDay = async () => calls.writes.length;
+    return calls;
+  }
+
+  console.log("\n【11】单模式: 发什么记什么, 探活/命令是唯一例外");
+  let sd = { [SECRET_TOKEN]: "TOK1" };
+  p = await newPlugin(sd, BOUND_DATA());
+  let calls = stubWriter(p);
+  let r = await p.agent._dispatch("今天试了新的手冲豆子", false, []);
+  check("普通内容 → 记", calls.writes.length === 1 && r.includes("记下来"), r);
+  r = await p.agent._dispatch("在吗在吗", false, []);
+  check("「在吗在吗」→ 状态回复, 不落库", calls.writes.length === 1 && r.includes("在的") && r.includes("已记 1 段"), r);
+  r = await p.agent._dispatch("开始记日记", false, []);
+  check("「开始记日记」→ 告知不用了, 不落库", calls.writes.length === 1 && r.includes("不用特意开始"), r);
+  r = await p.agent._dispatch("帮助", false, []);
+  check("「帮助」→ 指南, 不落库", calls.writes.length === 1 && r.includes("使用指南"), r);
+
+  console.log("\n【12】「结束」是仪式不是开关: 封存后继续发照样记");
+  r = await p.agent._dispatch("结束", false, []);
+  check("「结束」→ 封存", calls.finalized.length === 1 && !r.includes("不用特意"), r);
+  r = await p.agent._dispatch("又想起一件事", false, []);
+  check("封存后再发 → 照记(v0.2.1 会掉进闲聊丢掉)", calls.writes.length === 2, JSON.stringify(calls.writes));
+
+  console.log("\n【13】撤回与改称呼");
+  r = await p.agent._dispatch("撤回", false, []);
+  check("「撤回」→ 删最后一条", calls.writes.length === 1, r);
+  r = await p.agent._dispatch("叫我小明", false, []);
+  check("「叫我小明」短句 → 改称呼不落库", p.data.profile.name === "小明" && calls.writes.length === 1, r);
+  r = await p.agent._dispatch("叫我妈过来吃饭的时候记得提醒我带上钥匙", false, []);
+  check("「叫我」开头的长句是内容 → 照记", calls.writes.length === 2 && p.data.profile.name === "小明", r);
+
+  console.log("\n【14】首次见面: 内容优先, 取名一轮即过");
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => { const d = BOUND_DATA(); d.profile = { state: "unknown", name: null }; return d; })());
+  calls = stubWriter(p);
+  r = await p.agent._dispatch("帮我记一下明天要给妈妈买降压药", false, []);
+  check("第一句是内容 → 先记再欢迎", calls.writes.length === 1 && r.includes("随手记 Agent"), r);
+  r = await p.agent._dispatch("谷雨", false, []);
+  check("第二句像名字 → 取名", p.data.profile.name === "谷雨" && calls.writes.length === 1, r);
+
+  console.log("\n【15】首次见面发「在吗」: 欢迎语即回答; 之后长句不被取名吞掉");
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => { const d = BOUND_DATA(); d.profile = { state: "unknown", name: null }; return d; })());
+  calls = stubWriter(p);
+  r = await p.agent._dispatch("在吗", false, []);
+  check("第一句探活 → 欢迎语, 不落库", calls.writes.length === 0 && r.includes("随手记 Agent"), r);
+  r = await p.agent._dispatch("今天跟医生确认了下周复查的时间安排", false, []);
+  check("取名轮里的长句 → 当内容记, 不吞", calls.writes.length === 1 && r.includes("称呼不急"), r);
+  check("取名只问一轮", p.data.profile.state === "active");
+
+  console.log("\n【16】跨天: 宽限期外自动封存昨天, 新内容记到今天");
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => {
+    const d = BOUND_DATA();
+    const y = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    d.session = { mode: "diary", entered_date: y, chat_count_today: 0, last_activity_ts: Date.now() - 3 * 3600000, cost_reminder_shown_date: "" };
+    return d;
+  })());
+  calls = stubWriter(p);
+  calls.writes.push("昨天的旧段落");   // 让 finalizeDay 有东西可封
+  r = await p.agent._dispatch("新一天的第一条", false, []);
+  check("昨天被自动封存", calls.finalized.length === 1 && calls.finalized[0] !== "today", JSON.stringify(calls.finalized));
+  check("带告知 + 新内容照记", r.includes("自动收尾") && calls.writes.length === 2, r);
+
+  console.log("\n【17】换 bot 吞消息修复: 游标与去重表按 bot 判, 不按微信号");
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  p.data.ilink.buf = "OLD_CURSOR"; p.data.ilink.recentSeqs = ["s1", "s2"];
+  await p.onLoginConfirmed({ botToken: "TOK1", botId: "B1", userId: "U1", baseUrl: "" });
+  check("同人同 bot 重登 → 游标保留", p.data.ilink.buf === "OLD_CURSOR" && p.data.ilink.recentSeqs.length === 2);
+  await p.onLoginConfirmed({ botToken: "TOK2", botId: "B2", userId: "U1", baseUrl: "" });
+  check("同人换 bot → 游标/去重表清零(否则新 bot 前 N 条被吞)", p.data.ilink.buf === "" && p.data.ilink.recentSeqs.length === 0);
+  check("换 bot 不清称呼(还是同一个人)", p.data.profile.state === "active");
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);
