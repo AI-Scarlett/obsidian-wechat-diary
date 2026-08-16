@@ -302,6 +302,44 @@ Windows/Linux 关最后一个窗口即退出；macOS 不退但所有 BrowserWind
 
 **→ 决策：token 走 SecretStorage，其余非敏感配置（日记目录、提醒时间）留在 data.json。**
 
+### 🔴 补记 2026-08-14 —— 这条决策制造了一个线上故障，v0.2.1 修
+
+上面这个决策本身是对的，但它带来一个当时没想到的后果：**一份"绑定"被劈成了两半，
+存在两个生命周期完全不同的地方**，而代码从头到尾假设两半同生共死。
+
+| | 卸载插件 | 随 vault 同步 | 换设备/换路径 |
+|---|---|---|---|
+| `bot_token`（SecretStorage） | **不删** | **不走** | **丢** |
+| `userId`/`botId`/`baseUrl`（data.json） | **删** | **走** | 跟着 vault |
+
+任一半单独消失 → "半绑定"，而 v0.1.3 里没有任何一条路能走出来：
+`bound = token && userId` 二值判定把它错判成"未绑定" → 解除绑定按钮被禁用 →
+残留 token 又被塞进 `local_token_list` → 重新扫码必被服务端顶回 `binded_redirect` →
+而那个分支的文案还是错的（见 `protocol-notes.md` 勘误）。**用户被锁死。**
+
+**SecretStorage 的存储位置与隔离粒度（逆向 Obsidian asar 实测，1.13.x）**：
+`safeStorage.encryptString()` → `app.saveLocalStorage("secrets-encrypted")` →
+`localStorage["<appId>-secrets-encrypted"]`，落在 `%APPDATA%\obsidian\Local Storage\leveldb`。
+**`appId` 是按 vault 的绝对路径登记的**（`obsidian.json` 的 `vaults` 映射），
+且 `.obsidian/` 里没有任何携带 vault id 的文件。推论：
+
+- 库路径变了（OneDrive 已知文件夹移动、换盘、改用户名、打开的是同步冲突副本）
+  → 新 appId → **旧 secret 变孤儿**，而 data.json 跟着 vault 好端端地来了 = 半绑定。
+- 换机器 → secret 为零，data.json 却随同步盘到了 = 半绑定。
+- 卸载插件 → data.json 没了，secret 还在 = 半绑定（反过来的那一半）。
+
+**修法（v0.2.1）**：
+1. 绑定身份（userId/botId/baseUrl）**也存一份进 SecretStorage**（`wechat-diary-bind-identity`），
+   与 token 同生命周期。data.json 丢了在 `onload` 里无感恢复。
+2. 状态改三态 `bound / half / none`，半绑定不再伪装成未绑定，清理入口永远可用。
+3. `binded_redirect` 按官方语义当成功；有 token 就启动管道，userId 为空时进
+   "待认领"——**弹窗让人确认**才认主人（协议层没有 allowlist，不弹窗就是谁先说话谁当主人）。
+4. 解除绑定拆成「只清主人身份（保留凭据）」和「彻底解除」。后者可能不可逆：
+   服务端不补发凭据，清掉本机 token 后同一微信号重扫会被判 `binded_redirect`。
+5. 从 secret 恢复身份时，`buf` 和 `recentSeqs` 必然是空的 → 服务端可能回吐积压，
+   而写入用的是 `todayStr()`（报文里没有原始时间）→ 会把历史**按今天的日期重演一遍**，
+   连「撤回」「结束」都会被重放。所以恢复后的第一波只推游标不落笔，等长轮询空一次再开始记。
+
 **另外三条写文件的官方结论【已确认】**：
 - API 顺位：`Editor` > `Vault.process` > `Vault.modify`，Adapter API 是最后手段
 - ⚠️ **Obsidian 的"原子性"只是 in-process 串行队列**，底层 `fs.writeFile` 直接截断写，
@@ -326,6 +364,19 @@ Windows/Linux 关最后一个窗口即退出；macOS 不退但所有 BrowserWind
 - 020 从 019 抄（文案、意图规则、写入逻辑、协议知识）
 - 019 以后优化了，020 要跟进
 - 020 优化了，也要反哺回 019
+
+### ⚠️ 待办：契约 v1.1（图片）需要回灌 019 — 2026-08-12
+
+020 v0.2.0 加了图片接收，契约相应加了**规则 7（图片块）**和 `attachments/` 目录，
+已写进 020 的副本，**019 的权威版还没同步**。
+
+这是本项目第一次出现 **020 先行、019 跟进** 的方向，所以特别记一笔：
+
+- 变更是**向后兼容的增量** —— 019 不产出图片块，只要求它「读到 `![[...]]` 块时
+  当普通消息，别当坏数据修」，而它的 `count_messages` 天然满足。
+  所以两边产出的库仍可互相追加，**没有断层风险**，不是紧急项。
+- 但契约文本必须回灌，否则「权威版」名不副实 —— 下次有人只读 019 的契约，
+  会以为 `attachments/` 是野生目录。
 
 ---
 

@@ -6,6 +6,7 @@
  *
  * 工作原理: 扫码绑定微信 bot → 长轮询收消息(腾讯官方 iLink 协议, 直连不走代理)
  * → 意图识别(记日记/闲聊/撤回/结束) → 追加写入 vault 里的 日记/YYYY/YYYY-MM-DD.md。
+ * 图片走微信 CDN(AES-128-ECB 加密), 解密后存进 日记/attachments/, 笔记里插 ![[]]。
  * 写入格式与 Python 版逐字节一致(docs/data-contract.md), 两种形态可随时互迁。
  * bot token 与 AI Key 存 Obsidian 密钥存储(不进 vault, 不被同步盘带走)。
  *
@@ -2316,17 +2317,25 @@ var qrcode = function() {
 
 const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform, AbstractInputSuggest } = require("obsidian");
 
-const PLUGIN_VERSION = "0.1.3";
+const PLUGIN_VERSION = "0.2.1";
 const AGENT_NAME = "obsidian-wechat-diary";
 const BOT_AGENT = AGENT_NAME + "/" + PLUGIN_VERSION;
 const CHANNEL_VERSION = "2.4.6";               // 对齐官方 @tencent-weixin/openclaw-weixin
 const CLIENT_VERSION_HEADER = "132102";        // (2<<16)|(4<<8)|6, 版本号的 uint32 编码
 const FIXED_BASE_URL = "https://ilinkai.weixin.qq.com";
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";  // 官方 src/auth/accounts.ts:12
 const SECRET_BOT_TOKEN = "wechat-diary-ilink-bot-token";
 const SECRET_AI_KEY = "wechat-diary-ai-api-key";
+// 绑定身份(userId/botId/baseUrl)与 token 同库存放。它们本身不敏感, 放这里是为了
+// 生命周期一致: data.json 会被卸载删掉、被同步盘回滚, secret 不会。两半分家就是 v0.2.1
+// 修的那个"半绑定"故障的根源(见 00-decisions.md D5 补记)。
+const SECRET_BIND_ID = "wechat-diary-bind-identity";
 
 const LONG_POLL_TIMEOUT_MS = 35000;
 const SEND_TIMEOUT_MS = 15000;
+const MEDIA_TIMEOUT_MS = 60000;                // 图片下载: 手机拍的原图可能几 MB, 给足时间
+const MEDIA_MAX_BYTES = 100 * 1024 * 1024;     // 同官方 WEIXIN_MEDIA_MAX_BYTES
+const MEDIA_MAX_REDIRECTS = 3;                 // CDN 可能 302; Node https 不自动跟, 官方用的 fetch 会跟
 const NOTIFY_TIMEOUT_MS = 10000;
 const QR_FETCH_TIMEOUT_MS = 15000;
 const LOGIN_TOTAL_TIMEOUT_MS = 480000;
@@ -2429,6 +2438,10 @@ const HELP_TEXT = `📖 日记 Agent 使用指南
 • 撤回 → 删掉刚才记的最后一段 (仅记录模式)
 • 叫我XX → 设置/修改你的称呼 (闲聊模式下)
 
+【图片】
+记录模式下直接发图, 图会存进库里并插进今天的笔记;
+「撤回」同样能撤掉刚发的图。
+
 跨天会自动回到闲聊模式 (避免新一天的话被记到昨天);
 深夜写着写着过了零点也不怕, 半小时内继续说仍算前一晚。`;
 
@@ -2444,6 +2457,15 @@ const NOT_IN_DIARY_HINTS = {
   undo: "现在是闲聊模式哦, 还没开始记呢, 没东西可撤~ 想记的话发「开始记日记」",
   finalize: "现在是闲聊模式, 还没开始记呢~ 想记的话发「开始记日记」",
 };
+
+// 图片相关文案
+const IMAGE_NOT_IN_DIARY_HINT = "图片我先没收进日记~ 现在是闲聊模式, 发「开始记日记」再发图, 我就帮你收进今天的小册子 📷";
+const IMAGE_FAIL_REPLY = "这张图没存下来 😢 网络或格式的问题, 要不重发一次?";
+const IMAGE_DISK_FULL_REPLY = "存图片失败! 磁盘可能满了 💾 请检查磁盘空间";
+const IMAGE_PARTIAL_TEMPLATE = "(有 {n} 张没存下来, 可以重发一次)";
+function imageWrittenReply(n) {
+  return "📷 图片收好啦~ 这是今天第 " + n + " 段 ✍️\n继续说; 记错了发「撤回」, 说完了发「结束」";
+}
 
 const CLOSING_LINES = [
   "今天的故事我收好啦, 晚安 ✨",
@@ -2885,6 +2907,13 @@ class DiaryWriter {
     return normalizePath(folder + "/" + dateStr.slice(0, 4) + "/" + dateStr + ".md");
   }
 
+  // 附件与日记同根、按年分子目录: 日记/attachments/2026/2026-08-12-2104-a3f1.jpg
+  attachmentPath(dateStr, ext) {
+    const folder = normalizePath(this.plugin.settings.diaryFolder || "日记");
+    const name = dateStr + "-" + hhmmStr().replace(":", "") + "-" + randHex(4) + "." + ext;
+    return normalizePath(folder + "/attachments/" + dateStr.slice(0, 4) + "/" + name);
+  }
+
   async _ensureParents(path) {
     const vault = this.plugin.app.vault;
     const parts = path.split("/").slice(0, -1);
@@ -2913,6 +2942,25 @@ class DiaryWriter {
     }
   }
 
+  // 追加一个块。同一分钟共用段头, 文件不存在则连 frontmatter 一起建。返回最终全文。
+  _appendBlock(day, timestamp, block) {
+    return this._transform(this.diaryPath(day), (existing) => {
+      if (existing) {
+        const chunk = lastHeaderTime(existing) === timestamp
+          ? "\n" + block + "\n"
+          : "\n\n**" + timestamp + "**\n\n" + block + "\n";
+        return existing + chunk;
+      }
+      const header = "---\n" +
+        "date: " + day + "\n" +
+        "weekday: " + weekdayForDate(day) + "\n" +
+        "source: wechat-diary\n" +
+        "---\n\n" +
+        "# " + day + "\n";
+      return header + "\n\n**" + timestamp + "**\n\n" + block + "\n";
+    });
+  }
+
   // 写一条。返回 { reply, n }。永不抛。
   async write(text, isVoice, dateStr) {
     text = (text || "").trim();
@@ -2931,22 +2979,7 @@ class DiaryWriter {
 
     let finalContent;
     try {
-      const path = this.diaryPath(day);
-      finalContent = await this._transform(path, (existing) => {
-        if (existing) {
-          const block = lastHeaderTime(existing) === timestamp
-            ? "\n" + polished + "\n"
-            : "\n\n**" + timestamp + "**\n\n" + polished + "\n";
-          return existing + block;
-        }
-        const header = "---\n" +
-          "date: " + day + "\n" +
-          "weekday: " + weekdayForDate(day) + "\n" +
-          "source: wechat-diary\n" +
-          "---\n\n" +
-          "# " + day + "\n";
-        return header + "\n\n**" + timestamp + "**\n\n" + polished + "\n";
-      });
+      finalContent = await this._appendBlock(day, timestamp, polished);
     } catch (e) {
       console.error("[wechat-diary] 写日记失败:", e);
       // 【宿主适配】019 原文提的是「DIARY_DIR 所在盘」, 插件没有这个概念
@@ -2960,6 +2993,37 @@ class DiaryWriter {
     const reply = voiceMark + "嗯, 记下来啦~ 这是今天第 " + n + " 段 ✍️" + netNote +
       "\n继续说; 记错了发「撤回」, 说完了发「结束」";
     return { reply, n };
+  }
+
+  // 存一张图: 落进 vault 附件目录, 日记里插一个 ![[]] 块。
+  // 返回 { n, diskFull }; n === 0 表示没写成。永不抛。
+  async writeImage(buf, ext, dateStr) {
+    const day = dateStr || todayStr();
+    const timestamp = hhmmStr();
+    const vault = this.plugin.app.vault;
+    let path = "";
+    try {
+      path = this.attachmentPath(day, ext);
+      await this._ensureParents(path);
+      // 同一分钟连发多图时 4 位随机撞名的概率极小, 但撞了就是覆盖别人的图, 重摇几次
+      for (let i = 0; i < 5 && vault.getAbstractFileByPath(path); i++) path = this.attachmentPath(day, ext);
+      // Buffer 是内存池上的视图, 直接给 .buffer 会把整个池子写进去, 必须切出自己那段
+      await vault.createBinary(path, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    } catch (e) {
+      console.error("[wechat-diary] 存图片失败:", e);
+      return { n: 0, diskFull: String(e && e.message).includes("ENOSPC") };
+    }
+
+    let finalContent;
+    try {
+      // 完整 vault 路径的 wikilink: 不依赖用户的"最短路径"链接设置, 重名附件也不会指错
+      finalContent = await this._appendBlock(day, timestamp, "![[" + path + "]]");
+    } catch (e) {
+      console.error("[wechat-diary] 图片插入日记失败:", e);
+      // 图已经落盘了, 只是没插进笔记 —— 不删文件, 留给用户手动捞
+      return { n: 0, diskFull: String(e && e.message).includes("ENOSPC") };
+    }
+    return { n: countMessages(finalContent), diskFull: false };
   }
 
   // 撤回最后一条消息; 孤儿段头一并清理。返回是否删了东西。
@@ -3017,12 +3081,66 @@ class DiaryWriter {
   }
 }
 
-// ── iLink 协议客户端(对齐官方 openclaw-weixin 2.4.6; Node https 直连)────
+// ── 媒体: CDN 解密与格式识别(对齐官方 src/cdn/, src/media/)──────────────
 
 function getHttps() {
   if (!Platform.isDesktop) throw new Error("WeChat Diary 仅支持桌面端");
   return require("https");
 }
+
+function getCrypto() {
+  if (!Platform.isDesktop) throw new Error("WeChat Diary 仅支持桌面端");
+  return require("crypto");
+}
+
+// 取图片的 AES-128 key。认不出就返回 null → 按明文处理(同官方 downloadPlainCdnBuffer 分支)。
+function parseImageAesKey(img) {
+  // 官方注释: inbound 优先用 image_item.aeskey(16 字节的 hex), 它比 media.aes_key 可靠
+  const hex = String((img && img.aeskey) || "").trim();
+  if (/^[0-9a-fA-F]{32}$/.test(hex)) return Buffer.from(hex, "hex");
+  const b64 = img && img.media && img.media.aes_key;
+  if (!b64) return null;
+  const decoded = Buffer.from(String(b64), "base64");
+  if (decoded.length === 16) return decoded;                 // 图片: base64(裸 16 字节)
+  // 文件/语音走的是 base64(32 位 hex 字符串) —— 同一个字段两种编码, 官方 parseAesKey 也要分流
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("ascii"))) {
+    return Buffer.from(decoded.toString("ascii"), "hex");
+  }
+  return null;
+}
+
+function decryptAesEcb(ciphertext, key) {
+  const crypto = getCrypto();
+  try {
+    const d = crypto.createDecipheriv("aes-128-ecb", key, null);
+    return Buffer.concat([d.update(ciphertext), d.final()]);
+  } catch (e) {
+    // 尾块不是标准 PKCS7 时 final() 会抛; 关掉去填充再来一次, 多出来的尾字节不影响图片解码。
+    // 真解错了(key 不对)下游 sniffImageExt 会认不出格式, 兜得住。
+    const d2 = crypto.createDecipheriv("aes-128-ecb", key, null);
+    d2.setAutoPadding(false);
+    return Buffer.concat([d2.update(ciphertext), d2.final()]);
+  }
+}
+
+// 按 magic bytes 判图片类型。返回扩展名或 null。
+// 兼职做解密校验: 认不出 = 要么不是图, 要么 key 错了, 两种都不该往库里写。
+function sniffImageExt(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "png";
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return "gif";
+  if (buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "webp";
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return "bmp";
+  if (buf.toString("ascii", 4, 8) === "ftyp") {
+    const brand = buf.toString("ascii", 8, 12).toLowerCase();
+    if (brand.startsWith("hei") || brand.startsWith("hev") || brand === "mif1" || brand === "msf1") return "heic";
+    if (brand.startsWith("avi")) return "avif";
+  }
+  return null;
+}
+
+// ── iLink 协议客户端(对齐官方 openclaw-weixin 2.4.6; Node https 直连)────
 
 function respCode(o) {
   if (!o || typeof o !== "object") return 0;
@@ -3164,6 +3282,77 @@ class ILinkClient {
     return true;
   }
 
+  // CDN 二进制下载。裸 GET, 不带任何 iLink 鉴权头(同官方: CDN 用的是 URL 里的加密参数)。
+  // 不复用 this._agent: 那个 maxSockets=2 是留给长轮询的, 大图会把长轮询挤掉。
+  _rawBinary(urlStr, timeoutMs, hop) {
+    const https = getHttps();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const chunks = [];
+      let total = 0;
+      const done = (fn, v) => { if (!settled) { settled = true; window.clearTimeout(timer); this._inflight.delete(req); fn(v); } };
+      const req = https.request(new URL(urlStr), { method: "GET" }, (res) => {
+        const code = res.statusCode;
+        if (code >= 300 && code < 400 && res.headers.location) {
+          res.resume(); // 丢弃 body, 否则连接不释放
+          if ((hop || 0) >= MEDIA_MAX_REDIRECTS) { done(reject, new Error("CDN 重定向过多")); return; }
+          const next = new URL(res.headers.location, urlStr).toString();
+          done(resolve, { __redirect: next });
+          return;
+        }
+        if (code < 200 || code >= 300) {
+          res.resume();
+          done(reject, new Error("CDN HTTP " + code));
+          return;
+        }
+        const declared = Number(res.headers["content-length"] || 0);
+        if (declared > MEDIA_MAX_BYTES) {
+          res.resume();
+          done(reject, new Error("图片超过 100MB, 不收"));
+          return;
+        }
+        res.on("data", (d) => {
+          total += d.length;
+          if (total > MEDIA_MAX_BYTES) {
+            try { req.destroy(new Error("media-too-large")); } catch (e) { /* noop */ }
+            done(reject, new Error("图片超过 100MB, 不收"));
+            return;
+          }
+          chunks.push(d);
+        });
+        res.on("aborted", () => done(reject, new Error("下载中断")));
+        res.on("end", () => done(resolve, { __buf: Buffer.concat(chunks) }));
+      });
+      this._inflight.add(req);
+      const timer = window.setTimeout(() => {
+        try { req.destroy(new Error("media-timeout")); } catch (e) { /* noop */ }
+        done(reject, new Error("图片下载超时"));
+      }, timeoutMs);
+      req.on("error", (err) => done(reject, err));
+      req.end();
+    });
+  }
+
+  // 收图: 取 URL → 下载 → AES-128-ECB 解密。返回明文 Buffer, 失败抛错。
+  async downloadImage(img) {
+    const media = (img && img.media) || null;
+    // 官方优先用服务端下发的 full_url; 没有才客户端拼(ENABLE_CDN_URL_FALLBACK)
+    let url = String((media && media.full_url) || "").trim();
+    if (!url && media && media.encrypt_query_param) {
+      url = CDN_BASE_URL + "/download?encrypted_query_param=" + encodeURIComponent(media.encrypt_query_param);
+    }
+    if (!url) throw new Error("图片没有下载地址");
+
+    let r;
+    for (let hop = 0; ; hop++) {
+      r = await this._rawBinary(url, MEDIA_TIMEOUT_MS, hop);
+      if (!r.__redirect) break;
+      url = r.__redirect;
+    }
+    const key = parseImageAesKey(img);
+    return key ? decryptAesEcb(r.__buf, key) : r.__buf;
+  }
+
   // 上下线通知: 失败只记日志, 不阻塞(同官方)
   notify(which) {
     this._raw(this.apiBase(), "ilink/bot/msg/" + which, {
@@ -3228,6 +3417,47 @@ class DiaryAgent {
     const { reply, n } = await this.writer.write(text, isVoice, dateStr);
     if (n > 0 && n % NUDGE_EVERY === 0) return reply + "\n\n" + NUDGE_TEXT;
     return reply;
+  }
+
+  // 下载并写入一批图片(仅 diary 模式调用)。一张失败不连累其余。
+  async _writeImages(images, dateStr) {
+    this.session.last_activity_ts = Date.now();
+    const client = this.plugin._client;
+    if (!client) return IMAGE_FAIL_REPLY;
+    let ok = 0, failed = 0, lastN = 0, diskFull = false;
+    for (const img of images) {
+      try {
+        const buf = await client.downloadImage(img);
+        const ext = sniffImageExt(buf);
+        if (!ext) throw new Error("认不出图片格式(多半是解密失败)");
+        const res = await this.writer.writeImage(buf, ext, dateStr);
+        if (!res.n) { if (res.diskFull) diskFull = true; throw new Error("写入失败"); }
+        ok += 1;
+        lastN = res.n;
+      } catch (e) {
+        failed += 1;
+        console.error("[wechat-diary] 处理图片失败:", e && e.message);
+      }
+    }
+    if (!ok) return diskFull ? IMAGE_DISK_FULL_REPLY : IMAGE_FAIL_REPLY;
+    let reply = imageWrittenReply(lastN);
+    if (failed) reply = IMAGE_PARTIAL_TEMPLATE.split("{n}").join(String(failed)) + "\n\n" + reply;
+    if (lastN % NUDGE_EVERY === 0) reply += "\n\n" + NUDGE_TEXT;
+    return reply;
+  }
+
+  // 纯图片消息(微信发图就是单独一条, 不带文字)。不进文本状态机: 空文本喂进去只会得到"没听清"。
+  async _handleImageOnly(images, cross) {
+    if (this.session.mode === "diary") {
+      // 内容优先: 还没取名的用户照收不误(同文本路径 _dispatch 的第一分支)
+      return this._writeImages(images, cross.graceDate || undefined);
+    }
+    const profile = this.profile;
+    if (profile.state === "unknown" || !profile.state) {
+      profile.state = "awaiting_name"; // 头一句就发图: 先自我介绍(文本首条同样不落库)
+      return WELCOME_TEXT;
+    }
+    return IMAGE_NOT_IN_DIARY_HINT;
   }
 
   // 主业务路由(019 main.py _handle)
@@ -3301,12 +3531,15 @@ class DiaryAgent {
   }
 
   // 首次见面欢迎 + 取名流程, 之后才走主路由(019 main.py _dispatch)
-  async _dispatch(text, isVoice) {
+  async _dispatch(text, isVoice, images) {
     const cross = await this._loadOrReset();
     const profile = this.profile;
+    const hasText = !!(text || "").trim();
 
     let reply;
-    if (profile.state !== "active" && this.session.mode === "diary") {
+    if (!hasText && images.length) {
+      reply = await this._handleImageOnly(images, cross);
+    } else if (profile.state !== "active" && this.session.mode === "diary") {
       // 已在 diary 的非 active 用户: 内容优先, 取名流程不得吞日记
       reply = await this._handle(text, isVoice, cross);
     } else if (profile.state === "unknown" || !profile.state) {
@@ -3352,15 +3585,22 @@ class DiaryAgent {
       reply = await this._handle(text, isVoice, cross);
     }
 
+    // 图文同条: 微信通常拆成两条发, 但协议允许一条里既有 text 又有 image。
+    // 文字先按原路走完(可能刚好是「开始记日记」把模式切开), 图再按最终模式处理。
+    if (hasText && images.length && this.session.mode === "diary") {
+      const imgReply = await this._writeImages(images, cross.graceDate || undefined);
+      reply = reply ? reply + "\n\n" + imgReply : imgReply;
+    }
+
     if (reply && cross.expiredNotice) reply = cross.expiredNotice + "\n\n" + reply; // 告知在前(§3.3)
     return reply;
   }
 
   // 入口: 白名单兜底 → 路由 → 离线提示一次性附注
-  async onMessage(fromUserId, text, isVoice) {
+  async onMessage(fromUserId, text, isVoice, images) {
     // 陌生人静默丢弃(_handleIncoming 已挡, 这里兜底): 回复等于向未授权者确认 bot 存活
     if (fromUserId !== this.plugin.data.ilink.userId) return null;
-    let reply = await this._dispatch(text, isVoice);
+    let reply = await this._dispatch(text, isVoice, images || []);
     if (reply && this.offlineNotice) {
       reply = reply + "\n\n" + this.offlineNotice;
       this.offlineNotice = null;
@@ -3500,12 +3740,25 @@ class QrLoginModal extends Modal {
           return;
         }
         if (st === "binded_redirect") {
-          // 成功语义: 本地已有凭据继续有效, 不下发新凭据
-          if (plugin.getBotToken() && plugin.data.ilink.userId) {
-            new Notice("这个 bot 已经绑定过了, 沿用现有登录");
+          // 官方语义是【成功】, 不是失败 —— login-qr.ts:162-168 原文: "the scanned bot is
+          // already bound to this OpenClaw instance, so no new credentials are issued and
+          // existing local credentials remain valid. Callers should treat this as a
+          // successful outcome". v0.2.1 之前这里在缺 userId 时误报成"已绑定到别处",
+          // 把本来能救的半绑定判成了死局。
+          if (plugin.getBotToken()) {
+            const uid = (r.json && r.json.ilink_user_id) || "";
+            if (uid && !plugin.data.ilink.userId) await plugin.adoptOwner(uid);
+            if (plugin.data.ilink.userId) {
+              new Notice("这个 bot 已经连过了, 沿用现有登录");
+            } else {
+              // 服务端这一路不保证下发 ilink_user_id; 拿不到就交给管道认领
+              new Notice("这个 bot 已经连过了。给它发条消息, 就能把你认回来");
+              plugin.startPipeline();
+            }
             this.close();
           } else {
-            this._setStatus("该 bot 已绑定到别处。用当初绑定它的设备解绑, 或换个微信号扫。");
+            // 没有 token 又被判已连接: 本机凭据确实没了, 服务端不补发, 本地无解
+            this._setStatus("这个微信号已经连过一个 bot, 但本机凭据已丢失, 服务端不会补发。换个微信号扫可以立刻用上。");
           }
           return;
         }
@@ -3544,16 +3797,49 @@ class QrLoginModal extends Modal {
 
 function sleepMs(ms) { return new Promise((r) => window.setTimeout(r, ms)); }
 
+// onConfirm(keepToken): true = 只清主人身份、留着凭据(认错人了用这个);
+// false = 连凭据一起清。分两个按钮是因为清凭据可能不可逆 —— 服务端不补发凭据,
+// 一旦这个微信号在服务端还记着一条连接, 清掉本机 token 就再也扫不回来了。
 class ConfirmUnbindModal extends Modal {
-  constructor(app, onConfirm) { super(app); this.onConfirm = onConfirm; }
+  constructor(app, state, onConfirm) { super(app); this.state = state; this.onConfirm = onConfirm; }
   onOpen() {
-    this.titleEl.setText("解除微信绑定?");
-    this.contentEl.createEl("p", { text: "会清掉本机的登录凭据和同步进度, 日记文件不受影响。之后可以重新扫码绑定。" });
-    new Setting(this.contentEl)
-      .addButton((b) => b.setButtonText("解除绑定").setWarning().onClick(() => { this.close(); this.onConfirm(); }))
+    const half = this.state === "half";
+    this.titleEl.setText(half ? "清除本机残留凭据?" : "解除微信绑定?");
+    this.contentEl.createEl("p", { text: "日记文件不受影响, 只动本机的登录状态。" });
+    this.contentEl.createEl("p", {
+      text: half
+        ? "⚠️ 本机还留着微信登录凭据。清掉之后, 如果服务端仍记着这个微信号已经连过一个 bot, 扫码会拿不回新凭据 —— 那就只能换个微信号扫了。想恢复原来那个, 先给 bot 发条消息认领, 别点这里。"
+        : "⚠️ 「彻底解除」会一起清掉微信登录凭据。服务端不补发凭据, 之后用同一个微信号重扫可能会被判成「已连接过」而拿不到新凭据。只是想换个主人的话, 用左边那个。",
+    });
+    const s = new Setting(this.contentEl);
+    if (!half) {
+      s.addButton((b) => b.setButtonText("只清主人身份").onClick(() => { this.close(); this.onConfirm(true); }));
+    }
+    s.addButton((b) => b.setButtonText(half ? "清除凭据" : "彻底解除").setWarning().onClick(() => { this.close(); this.onConfirm(false); }))
       .addButton((b) => b.setButtonText("先不了").onClick(() => this.close()));
   }
   onClose() { this.contentEl.empty(); }
+}
+
+// 待认领确认。协议层没有 allowlist(陌生人可直达 bot), 所以认主人这一步必须由人点头,
+// 不能"谁先发消息谁是主人"。关掉窗口 = 不认, 下一条消息会再问一次。
+class ClaimOwnerModal extends Modal {
+  constructor(app, userId, onDone) { super(app); this.userId = userId; this.onDone = onDone; this._answered = false; }
+  onOpen() {
+    this.titleEl.setText("是你在给 bot 发消息吗?");
+    this.contentEl.createEl("p", { text: "本机还留着微信登录凭据, 但不知道主人是谁了(重装插件或换设备会这样)。" });
+    this.contentEl.createEl("p", { text: "刚刚有个微信用户给这个 bot 发了消息: " + String(this.userId).slice(0, 18) + "…" });
+    this.contentEl.createEl("p", { text: "确认是你本人, 才会开始把消息写进日记。不是的话直接关掉。" });
+    new Setting(this.contentEl)
+      .addButton((b) => b.setButtonText("是我, 恢复记录").setCta().onClick(() => { this._answered = true; this.close(); this.onDone(true, true); }))
+      .addButton((b) => b.setButtonText("不是").onClick(() => { this._answered = true; this.close(); this.onDone(false, true); }));
+  }
+  onClose() {
+    this.contentEl.empty();
+    // 叉掉/Esc 也要放开 _claiming, 否则再没人问了。但这不算"明确否认",
+    // 不拉黑这个 id —— 误触 Esc 不该让人整个会话都认不回来。
+    if (!this._answered) this.onDone(false, false);
+  }
 }
 
 // ── 设置页 ───────────────────────────────────────────────────────────────
@@ -3568,23 +3854,27 @@ class WechatDiarySettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("微信").setHeading();
 
-    const bound = Boolean(plugin.getBotToken() && plugin.data.ilink.userId);
-    const bindDesc = bound
+    const state = plugin.bindState();
+    const bindDesc = state === "bound"
       ? "已绑定 (" + String(plugin.data.ilink.userId).slice(0, 18) + "…)。消息管道在 Obsidian 打开期间运行。"
-      : "未绑定。扫码后, 对微信 bot 说话就能写进库里。";
+      : state === "half"
+        ? "待认领: 本机凭据还在, 但主人身份丢了(重装插件或换设备会这样)。给微信 bot 发条消息, 这里会弹确认。"
+        : "未绑定。扫码后, 对微信 bot 说话就能写进库里。";
     new Setting(containerEl)
       .setName("绑定状态")
       .setDesc(bindDesc)
-      .addButton((b) => b.setButtonText(bound ? "重新扫码" : "扫码绑定").setCta()
+      .addButton((b) => b.setButtonText(state === "none" ? "扫码绑定" : "重新扫码").setCta()
         .onClick(() => new QrLoginModal(this.app, plugin).open()))
       .addButton((b) => {
-        b.setButtonText("解除绑定").onClick(() => {
-          new ConfirmUnbindModal(this.app, async () => {
-            await plugin.unbind();
+        b.setButtonText(state === "half" ? "清除残留凭据" : "解除绑定").onClick(() => {
+          new ConfirmUnbindModal(this.app, state, async (keepToken) => {
+            await plugin.unbind(keepToken);
             this.display();
           }).open();
         });
-        if (!bound) b.setDisabled(true);
+        // 只要还有任何一半残留就必须能清 —— 这个按钮在半绑定时被禁用, 正是 v0.2.1
+        // 之前用户被锁死的直接原因: 清不掉残留 token, 重新扫码就永远被顶回来。
+        if (state === "none") b.setDisabled(true);
       });
 
     // 日记文件夹: 输入即搜索(同核心设置"附件默认存放路径"的交互)——
@@ -3682,7 +3972,7 @@ const DEFAULT_DATA = () => ({
   ilink: {
     botId: "", userId: "", baseUrl: "", buf: "",
     contextTokens: {}, recentSeqs: [], pauseUntil: 0, lastAliveTs: 0, loginTime: "",
-    botTokenFallback: "",
+    botTokenFallback: "", skipBacklog: false,
   },
   profile: { state: "unknown", name: null },
   session: { mode: "chat", entered_date: "", chat_count_today: 0, last_activity_ts: 0, cost_reminder_shown_date: "" },
@@ -3701,6 +3991,23 @@ class WechatDiaryPlugin extends Plugin {
     this.settings = this.data.settings;
     setTimezone(this.settings.timezone);
 
+    // data.json 丢了但 token 还在(卸载重装/同步盘回滚)时, 从 secret 里把身份取回来。
+    // 顺序在 setTimezone 之后、管道启动之前, 让后面所有判断看到的都是补全过的状态。
+    let restored = false;
+    if (!this.data.ilink.userId && this.getBotToken()) {
+      const id = this.getBindIdentity();
+      if (id) {
+        const il = this.data.ilink;
+        il.userId = id.userId;
+        il.botId = il.botId || id.botId || "";
+        il.baseUrl = il.baseUrl || id.baseUrl || "";
+        il.skipBacklog = true;
+        restored = true;
+        await this.persist();
+        console.log("[wechat-diary] 从密钥存储恢复了绑定身份");
+      }
+    }
+
     this.ai = new AiClient(this);
     this.writer = new DiaryWriter(this, this.ai);
     this.chatHandler = new ChatHandler(this.ai);
@@ -3713,6 +4020,13 @@ class WechatDiaryPlugin extends Plugin {
     this._sleepCancels = new Set();
     this._unloaded = false;
     this._activeQrModal = null;
+    this._claiming = false;
+    this._declinedClaims = new Set();   // 本次会话里答过"不是"的, 不再反复弹
+    // 身份是从 secret 恢复来的 = data.json 没了 = 游标(buf)和去重表(recentSeqs)一起没了。
+    // 此时服务端对空游标可能回吐一大段积压消息, 而去重表是空的 —— 照写就会把历史
+    // 按【今天】的日期重演一遍(write() 用 todayStr(), 消息报文里没有原始时间),
+    // 连「撤回」「结束」这类命令都会被重放。所以先把积压静默跳过, 等流量安静下来再落笔。
+    this._skipBacklog = restored || Boolean(this.data.ilink.skipBacklog);
 
     this.settingTab = new WechatDiarySettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
@@ -3733,8 +4047,10 @@ class WechatDiaryPlugin extends Plugin {
       if (this._running) this.persist();
     }, 5 * 60 * 1000));
 
+    // 有 token 就起管道 —— 缺 userId 时进"待认领"模式(只推游标不落笔, 见 _handleIncoming),
+    // 让用户发一条消息就能把自己认回来, 而不是卡在未绑定界面无路可走。
     this.app.workspace.onLayoutReady(() => {
-      if (this.getBotToken() && this.data.ilink.userId) this.startPipeline();
+      if (this.getBotToken()) this.startPipeline();
     });
   }
 
@@ -3775,6 +4091,33 @@ class WechatDiaryPlugin extends Plugin {
     else new Notice("需要 Obsidian 1.11.4+ 才能安全保存 Key");
   }
 
+  // 绑定身份的副本, 与 token 同库。data.json 没了(卸载/同步盘回滚)时靠它无感恢复。
+  getBindIdentity() {
+    const ss = this._secrets();
+    if (!ss) return null;
+    try {
+      const raw = ss.getSecret(SECRET_BIND_ID);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      return o && o.userId ? o : null;
+    } catch (e) { return null; }   // 手改坏了就当没有, 不能让它挡住启动
+  }
+
+  setBindIdentity(userId, botId, baseUrl) {
+    const ss = this._secrets();
+    if (!ss) return;
+    if (!userId) { ss.setSecret(SECRET_BIND_ID, ""); return; }
+    ss.setSecret(SECRET_BIND_ID, JSON.stringify({ userId, botId: botId || "", baseUrl: baseUrl || "" }));
+  }
+
+  // 三态: bound(可用) / half(有凭据缺主人, 待认领) / none。
+  // v0.2.1 之前这里是二值的, 半绑定被错判成"未绑定", 于是解绑按钮被禁用、
+  // 残留 token 又顶得重新扫码必回 binded_redirect —— 用户被锁死在里面出不来。
+  bindState() {
+    if (!this.getBotToken()) return "none";
+    return this.data.ilink.userId ? "bound" : "half";
+  }
+
   async persist() { await this.saveData(this.data); }
 
   _setStatus(text) { this.statusEl.setText("📖 微信日记: " + text); }
@@ -3800,9 +4143,42 @@ class WechatDiaryPlugin extends Plugin {
       this.data.profile = { state: "unknown", name: null };
       this.data.session = DEFAULT_DATA().session;
     }
+    il.skipBacklog = false;                       // 重新登录 = 重新算账, 不带着上一轮的跳过状态
+    this._skipBacklog = false;
+    this.setBindIdentity(userId, botId, baseUrl); // 与 token 同库, 卸载重装后能自己回来
     await this.persist();
     this.startPipeline();
     this._refreshSettingsUi(); // 绑定成功后设置页立即显示"已绑定", 不能还挂着扫码按钮
+  }
+
+  // 待认领状态下有人发来消息: 弹一次确认。同一个 from 不重复弹, 弹窗开着时也不叠。
+  _askClaimOwner(from) {
+    if (this._unloaded || this._claiming) return;
+    if (this._declinedClaims && this._declinedClaims.has(from)) return;
+    this._claiming = true;
+    // explicit: 点了"不是"才拉黑; 叉掉/Esc 只放开锁, 下条消息还会再问
+    new ClaimOwnerModal(this.app, from, async (ok, explicit) => {
+      this._claiming = false;
+      if (ok) await this.adoptOwner(from);
+      else if (explicit && this._declinedClaims) this._declinedClaims.add(from);
+    }).open();
+  }
+
+  // 认回主人: 只补身份, 不动日记、不动 settings。
+  async adoptOwner(userId) {
+    if (this._unloaded || !userId || this.data.ilink.userId) return;
+    const il = this.data.ilink;
+    il.userId = userId;
+    il.loginTime = il.loginTime || new Date().toISOString();
+    // 走到认领 = buf 游标必然是空的(不然身份不会丢), 服务端可能还在回吐积压。
+    // 认领后同样先只推游标, 等一次空轮询再落笔 —— 提示文案"再发一条就开始记"说的就是这个。
+    il.skipBacklog = true;
+    this._skipBacklog = true;
+    this.setBindIdentity(userId, il.botId, il.baseUrl);
+    await this.persist();
+    this._setStatus("已连接");
+    this._refreshSettingsUi();
+    new Notice("认回来了 📖 再发一条就开始记");
   }
 
   _refreshSettingsUi() {
@@ -3812,14 +4188,22 @@ class WechatDiaryPlugin extends Plugin {
     } catch (e) { /* 设置页没开着, 不用刷 */ }
   }
 
-  async unbind() {
+  // keepToken: 只清主人身份, 留着凭据回到"待认领"(认错人时的复位入口)。
+  // 默认 false = 连凭据一起清, 这一步可能不可逆, 调用方必须先确认过。
+  async unbind(keepToken) {
     this.stopPipeline();
-    this.setBotToken("");
+    const token = keepToken ? this.getBotToken() : "";
     const keep = this.data.settings;
     this.data = DEFAULT_DATA();
     this.data.settings = keep;
     this.settings = keep;
+    // 必须在重置 data 之后写: 没有 secretStorage 的宿主上 token 就落在 data.ilink 里,
+    // 先写会被 DEFAULT_DATA() 抹掉 —— keepToken 会变成静默失效。
+    this.setBotToken(token);
+    this.setBindIdentity("");   // 身份副本一起清, 否则下次 onload 又给"恢复"回来
+    this._declinedClaims = new Set();  // 复位后重新开放认领
     await this.persist();
+    if (token) { this.startPipeline(); return; }   // 待认领: 管道继续跑, 等人发消息
     this._setStatus("未绑定");
   }
 
@@ -3840,12 +4224,25 @@ class WechatDiaryPlugin extends Plugin {
     this._noticedDown = false;
     this.agent.offlineNotice = this._computeOfflineNotice();
     if (!this._isPaused()) this._client.notify("notifystart");
-    this._setStatus("已连接");
+    this._setStatus(this.bindState() === "half" ? "待认领, 给 bot 发条消息" : "已连接");
     this._loop().catch((e) => {
       console.error("[wechat-diary] 管道异常退出:", e);
       this._running = false;
       this._setStatus("管道异常, 重启插件恢复");
     });
+  }
+
+  // 解除"只推游标不落笔"。两个入口都要调: 空批次, 和长轮询超时。
+  // 落盘: 追平之前用户关掉 Obsidian 的话, 下次启动 userId 已在 data.json 里(不再走恢复分支),
+  // 光靠内存标志会失效, 那一整段积压就会在下次启动时被当成新消息写进今天。
+  async _clearSkipBacklog() {
+    if (!this._skipBacklog) return;
+    this._skipBacklog = false;
+    this.data.ilink.skipBacklog = false;
+    const n = this._skippedCount || 0;
+    this._skippedCount = 0;
+    await this.persist();
+    if (n) new Notice("微信日记: 已跳过离线期间的 " + n + " 条历史消息, 现在开始正常记录");
   }
 
   _isPaused() {
@@ -3916,7 +4313,11 @@ class WechatDiaryPlugin extends Plugin {
         continue;
       }
       if (dead()) break;
-      if (r.__timeout) continue; // 长轮询正常心跳, 立即下一轮
+      // 长轮询正常心跳 = 服务端没东西给了 = 积压追平。必须在这里也解除跳过:
+      // 服务端到底会不会返回一个 msgs 为空的响应是未知的(协议笔记 P0 第 1 条),
+      // 只认"空 msgs"的话, 一旦它选择 hold 到超时, _skipBacklog 就永远解不掉,
+      // 插件会安静地再也不写日记 —— 比重复写还糟。
+      if (r.__timeout) { await this._clearSkipBacklog(); continue; }
 
       const code = respCode(r.json);
       if (code === STALE_TOKEN_ERRCODE) {
@@ -3942,6 +4343,9 @@ class WechatDiaryPlugin extends Plugin {
       // 官方是先推进 cursor 再处理; 日记场景反过来——整批处理完才推进 buf,
       // 中途退出/崩溃就重放这一批(recentSeqs 去重兜底), 用户的话不静默丢
       const msgs = Array.isArray(r.json.msgs) ? r.json.msgs : [];
+
+      if (msgs.length === 0) await this._clearSkipBacklog(); // 空批次同样说明追平了
+
       let batchDone = true;
       for (const msg of msgs) {
         if (dead()) { batchDone = false; break; }
@@ -3961,10 +4365,20 @@ class WechatDiaryPlugin extends Plugin {
     if (msg.message_state === 1) return; // GENERATING 半成品
     const il = this.data.ilink;
 
-    // 白名单最先: 协议层没有 allowlist, 陌生人可直达 bot。
-    // 不回复(等于确认 bot 存活)、不存 token(data.json 会被陌生人无限撑大), 静默丢弃
     const from = msg.from_user_id || "";
-    if (!from || from !== il.userId) return;
+    if (!from) return;
+
+    // 待认领: 有 token 但 userId 丢了。这里一个字都不写 —— 游标照常推进(_loop),
+    // 服务端积压的旧消息因此被干净跳过, 不会在日记里重复成一片。认领要用户在
+    // Obsidian 里点确认: 协议层没有 allowlist, 不弹窗就等于谁先发消息谁当主人。
+    if (!il.userId) { this._askClaimOwner(from); return; }
+
+    // 恢复身份后的第一波: 只推游标不落笔(见 onload 处 _skipBacklog 的说明)
+    if (this._skipBacklog) { this._skippedCount = (this._skippedCount || 0) + 1; return; }
+
+    // 白名单: 协议层没有 allowlist, 陌生人可直达 bot。
+    // 不回复(等于确认 bot 存活)、不存 token(data.json 会被陌生人无限撑大), 静默丢弃
+    if (from !== il.userId) return;
 
     const seqKey = msg.seq != null ? "s" + msg.seq : (msg.message_id != null ? "m" + msg.message_id : "");
     if (seqKey) {
@@ -3979,14 +4393,16 @@ class WechatDiaryPlugin extends Plugin {
     let text = "";
     let hasText = false;
     let hasVoice = false;
+    const images = [];
     for (const item of msg.item_list || []) {
       if (item.type === 1 && item.text_item) { text += item.text_item.text || ""; hasText = true; }
       else if (item.type === 3 && item.voice_item) { text += item.voice_item.text || ""; hasVoice = true; }
+      else if (item.type === 2 && item.image_item) { images.push(item.image_item); }
     }
-    if (!hasText && !hasVoice) return; // 图片/文件/视频等, 日记场景忽略
+    if (!hasText && !hasVoice && !images.length) return; // 文件/视频等, 日记场景仍忽略
     const isVoice = hasVoice && !hasText;
 
-    const reply = await this.agent.onMessage(from, text, isVoice);
+    const reply = await this.agent.onMessage(from, text, isVoice, images);
     if (reply && from) {
       // 冷却期不出站(官方 assertSessionActive 语义): 日记已写入, 只是确认回执发不出
       if (this._isPaused() || !this._client) return;
@@ -4009,6 +4425,7 @@ WechatDiaryPlugin.__internals = {
   countMessages, isMessageBlock, lastHeaderTime,
   todayStr, hhmmStr, weekdayForDate, yesterdayStr, setTimezone,
   ILinkClient, respCode,
+  parseImageAesKey, sniffImageExt, decryptAesEcb,
   INTENT, texts: { WELCOME_TEXT, HELP_TEXT, NUDGE_TEXT },
 };
 

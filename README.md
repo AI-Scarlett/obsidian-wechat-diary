@@ -2,7 +2,7 @@
 
 **Talk to WeChat — your words land in your Obsidian vault as daily Markdown notes.**
 
-WeChat is the highest-frequency input box in a Chinese-speaking user's day. This plugin turns it into a zero-friction capture pipeline: scan a QR code once to bind a WeChat bot, then send text or voice messages to it from your phone anytime. While Obsidian is open on your desktop, every message is appended to `Diary/YYYY/YYYY-MM-DD.md` in your vault — plain Markdown, entirely on your machine.
+WeChat is the highest-frequency input box in a Chinese-speaking user's day. This plugin turns it into a zero-friction capture pipeline: scan a QR code once to bind a WeChat bot, then send text, voice, or photos to it from your phone anytime. While Obsidian is open on your desktop, every message is appended to `Diary/YYYY/YYYY-MM-DD.md` in your vault — plain Markdown, entirely on your machine.
 
 This is the Obsidian-plugin form of [wechat-diary](https://github.com/ArtemisLin/wechat-diary) (Python). Both implementations write byte-identical files under the same [data contract](docs/data-contract.md), so you can switch between them at any time.
 
@@ -10,6 +10,7 @@ This is the Obsidian-plugin form of [wechat-diary](https://github.com/ArtemisLin
 
 - **Two modes**: casual chat (default, nothing recorded) and diary mode — say 「开始记日记」 to start recording, 「结束」 to seal the day. Commands: 「撤回」 undo last entry, 「帮助」 help.
 - **Voice friendly**: WeChat transcribes voice messages for you; they arrive as text with a 🎤 mark.
+- **Photos**: send a picture in diary mode and it is decrypted from WeChat's CDN, saved into `Diary/attachments/YYYY/`, and embedded in the day's note. 「撤回」 undoes a photo too.
 - **Works with zero AI keys**: raw text is stored as-is. Optionally configure any OpenAI-compatible API for light polishing and small talk.
 - **Data sovereignty**: notes are plain Markdown in your vault. No cloud service of ours, no account with us, no telemetry.
 - **Append-only and atomic**: history paragraphs are never rewritten; frontmatter is stable; the format is a documented contract any agent can read.
@@ -40,8 +41,11 @@ No other network requests are made. There is no telemetry, no analytics, and no 
 
 ```
 Diary/
-└── 2026/
-    └── 2026-08-12.md
+├── 2026/
+│   └── 2026-08-12.md
+└── attachments/
+    └── 2026/
+        └── 2026-08-12-2305-a3f1.jpg
 ```
 
 ```markdown
@@ -56,6 +60,8 @@ source: wechat-diary
 **23:05**
 
 今天试了新的手冲豆子, 花香很明显。
+
+![[Diary/attachments/2026/2026-08-12-2305-a3f1.jpg]]
 ```
 
 Full rules in [docs/data-contract.md](docs/data-contract.md): append-only, Beijing-time dates (timezone configurable), one `\n\n`-separated block per message, sealing footnote on 「结束」.
@@ -66,7 +72,8 @@ Full rules in [docs/data-contract.md](docs/data-contract.md): append-only, Beiji
 
 对着微信说话, 日记自动落进你自己电脑的 Obsidian 库。
 
-- 设置里扫码绑定一次, 之后手机上任何时刻发文字/语音给 bot, Obsidian 开着就会写进 `日记/YYYY/YYYY-MM-DD.md`。
+- 设置里扫码绑定一次, 之后手机上任何时刻发文字/语音/图片给 bot, Obsidian 开着就会写进 `日记/YYYY/YYYY-MM-DD.md`。
+- 记录模式下发图: 图片存进 `日记/attachments/YYYY/`, 笔记里插 `![[...]]`;「撤回」同样撤得掉(只删引用, 图片文件保留)。
 - 发「开始记日记」进入记录模式, 「结束」收尾归档, 「撤回」删掉最后一段, 「帮助」看全部命令。不在记录模式时是闲聊, 随口说的话不会被误记。
 - 不配 AI Key 也是完整产品(原文直存); 配上任意 OpenAI 兼容接口后, 写入前会轻度润色、闲聊走大模型。
 - 数据只在你机器上: 凭据存 Obsidian 密钥存储, 不进 vault、不被同步盘带走; 无遥测、无作者服务器。

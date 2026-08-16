@@ -104,11 +104,27 @@ export interface GetUpdatesResp {
 | `scaned_but_redirect` | **要换个 host 继续轮询** | ❌ 不认识 → 空等到超时 |
 | `need_verifycode` | **需要输入验证码**（账号级风控） | ❌ 不认识 → 空等 5 分钟 |
 | `verify_code_blocked` | **验证码被封** | ❌ 不认识 → 空等 5 分钟 |
-| `binded_redirect` | 该 bot 已绑到别处 | ❌ 不认识 |
+| `binded_redirect` | **成功语义**: 已经连过了, 不下发新凭据, 本地凭据继续有效 | ❌ 不认识 |
 | ~~`cancel`/`canceled`/`cancelled`~~ | **官方根本没有这三个** | 019 专门写了分支——要么对应未文档化的返回，要么是死代码 |
 
 **`need_verifycode` 的存在证明腾讯对具体账号会做验证码级风控。**
 触发条件、阈值、解封方式全部无文档。
+
+> 🔴 **勘误 2026-08-14：上表里 `binded_redirect` 原先写的是「该 bot 已绑到别处」，是错的。**
+>
+> 官方 `src/auth/login-qr.ts:162-168` 的注释原文：
+> > Server reported `binded_redirect`: the scanned bot is **already bound to this OpenClaw
+> > instance**, so no new credentials are issued and **existing local credentials remain
+> > valid**. Callers should treat this as a **successful outcome** ("already done") rather
+> > than a login failure.
+>
+> 官方 CLI 走到该分支打印的是 `✅ 已连接过此 OpenClaw，无需重复连接。`（`login-qr.ts:389-397`）。
+>
+> **这条笔记的错误直接生成了一个线上故障**：020 v0.1.3 照着"绑到别处"实现，
+> 在本地有 token 但 data.json 丢失（卸载重装）时把用户引向"找作者做服务端解绑"——
+> 而**服务端解绑这个操作根本不存在**：整个官方包里没有任何 unbind 端点，
+> 官方自己的 `clearWeixinAccount()`（`src/auth/accounts.ts:219-238`）也只删本地四个文件，
+> 一个网络请求都不发。v0.2.1 已修，见 `00-decisions.md` D5 补记。
 
 ### ⑤ header 和 `base_info` 少了字段 ✅
 
@@ -155,6 +171,7 @@ SKRouteTag:         (条件性)                ← 019 缺
 | `POST /ilink/bot/getupdates` | 长轮询收消息 | ✅ |
 | `POST /ilink/bot/sendmessage` | 发消息 | ✅ |
 | `getuploadurl` / `getconfig` / `sendtyping` / `msg/notifystop` / `msg/notifystart` | 媒体上传、配置、输入态、中断控制 | ❌ 全没有 |
+| `GET {cdn}/download?encrypted_query_param=` | **收图**（CDN，非 iLink 域，裸 GET 无鉴权头） | 020 v0.2.0 起 ✅ |
 
 ### 枚举（`src/api/types.ts` 逐字）✅
 
@@ -169,7 +186,7 @@ MessageItemType = { NONE:0, TEXT:1, IMAGE:2, VOICE:3, FILE:4, VIDEO:5,
 （019 的注释写着"含义未知"，现在可以填上了。）
 
 图片/文件/视频走 CDN 且 **AES-128-ECB 加密**（`src/cdn/aes-ecb.ts`）。
-019 只处理 TEXT(1) 和 VOICE(3)，其余忽略——对日记场景够用。
+019 只处理 TEXT(1) 和 VOICE(3)；**020 自 v0.2.0 起加上 IMAGE(2)**，FILE/VIDEO 仍忽略。
 
 ### 收到的消息
 
@@ -180,12 +197,47 @@ MessageItemType = { NONE:0, TEXT:1, IMAGE:2, VOICE:3, FILE:4, VIDEO:5,
   "context_token": "...",    // ← 见第 3 节
   "item_list": [
     { "type": 1, "text_item":  { "text": "文字" } },
-    { "type": 3, "voice_item": { "text": "微信已转写好的文字" } }
+    { "type": 3, "voice_item": { "text": "微信已转写好的文字" } },
+    { "type": 2, "image_item": { /* 见下 */ } }
   ]
 }
 ```
 
 语音是**微信自己转写好的**，不需要你做 ASR。转写失败时 text 为空。
+
+### 收图（`src/api/types.ts:101` + `src/media/media-download.ts`）✅
+
+```jsonc
+{ "type": 2, "image_item": {
+    "media": { "full_url": "...", "encrypt_query_param": "...",
+               "aes_key": "base64", "encrypt_type": 1 },
+    "thumb_media": { ... },        // 缩略图，另一份独立的 CDN 引用
+    "aeskey": "32 位 hex",         // ← inbound 优先用这个
+    "hd_size": 0, "mid_size": 0 } }
+```
+
+三步：**URL → 裸 GET → AES-128-ECB 解密**。
+
+1. **URL**：优先服务端下发的 `media.full_url`；没有才客户端拼
+   `{cdn}/download?encrypted_query_param=<urlencode>`，
+   `cdn` 默认 `https://novac2c.cdn.weixin.qq.com/c2c`（`src/auth/accounts.ts:12`）。
+2. **下载**：CDN 不吃任何 iLink 鉴权头，鉴权信息就在 URL 的加密参数里。
+   官方用 `fetch`（会自动跟 302）；用 Node `https` 要**自己跟重定向**。
+3. **解密**：key 优先 `image_item.aeskey`（hex → 16 字节）；退回 `media.aes_key` 时
+   ⚠️ **同一字段两种编码**（`src/cdn/pic-decrypt.ts` 的 `parseAesKey`）：
+   base64 解出 **16 字节** = 图片（裸 key）；解出 **32 个 ASCII hex 字符** = 文件/语音/视频，
+   还要再 hex 解一次。没有 key 时官方走明文下载分支（`downloadPlainCdnBuffer`）。
+
+> 💡 解密对不对**没有校验位**。用 magic bytes 认图片格式可以兼职当校验——
+> key 错了解出来必然不是合法图头。
+
+上限 100MB（官方 `WEIXIN_MEDIA_MAX_BYTES`）。
+
+**发图**（本项目不做，记录备查）：`getuploadurl`（报明文大小、密文大小
+`ceil((n+1)/16)*16`、MD5、`no_need_thumb`）→ AES 加密后 POST 到 CDN →
+从响应头 `x-encrypted-param` 取回下载参数 → 拼 IMAGE item 发送。
+⚠️ 发送时 `aes_key` 填的是 `base64(hex 字符串)`（`src/messaging/send.ts:223`），
+**与收图那边的编码又不一样**。
 
 ### 错误码
 
