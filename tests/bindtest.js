@@ -286,6 +286,13 @@ async function newPlugin(secrets, storedData) {
   check("欢迎语动态填文件夹", I.welcomeText("PersonalGuyu/Diary").includes("「PersonalGuyu/Diary」文件夹"));
   check("欢迎语教在哪改", I.welcomeText("日记").includes("第三方插件 → WeChat Diary"));
 
+  console.log("\n【21】封存后同分钟续写另起段头(019 e2e 抓出, 两侧同修)");
+  const sealed = "# 2026-08-16\n\n**22:04**\n\n封存前\n\n---\n_(今日封存于 22:04)_\n";
+  check("封存线在最后段头之后 → 不并入", I.canMergeIntoLastHeader(sealed, "22:04") === false);
+  check("不同分钟 → 不并入", I.canMergeIntoLastHeader("**22:04**\n\nx\n", "22:05") === false);
+  check("同分钟且未封存 → 并入", I.canMergeIntoLastHeader("**22:04**\n\nx\n", "22:04") === true);
+  check("封存后又开了同分钟新段头 → 可并入", I.canMergeIntoLastHeader(sealed + "\n\n**22:04**\n\n封存后\n", "22:04") === true);
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);

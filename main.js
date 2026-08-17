@@ -2898,6 +2898,16 @@ function lastHeaderTime(content) {
   return last;
 }
 
+// 同分钟合并的前提: 最后一个段头是同一分钟, **且它在最后一个封存标记之后**。
+// 单模式下「结束」后同一分钟继续发, 不能把新内容塞到封存线下面去当无头段落——
+// 要另起段头 (2026-08-16 019 e2e 冒烟抓出, 两侧同步修)。
+function canMergeIntoLastHeader(content, timestamp) {
+  let last = null;
+  for (const m of content.matchAll(HEADER_RE_G)) last = m;
+  if (!last || last[1] !== timestamp) return false;
+  return content.lastIndexOf(CLOSING_MARKER) < last.index;
+}
+
 function isMessageBlock(stripped) {
   if (!stripped) return false;
   if (stripped.startsWith("# ")) return false;
@@ -2958,7 +2968,7 @@ class DiaryWriter {
   _appendBlock(day, timestamp, block) {
     return this._transform(this.diaryPath(day), (existing) => {
       if (existing) {
-        const chunk = lastHeaderTime(existing) === timestamp
+        const chunk = canMergeIntoLastHeader(existing, timestamp)
           ? "\n" + block + "\n"
           : "\n\n**" + timestamp + "**\n\n" + block + "\n";
         return existing + chunk;
@@ -4410,7 +4420,7 @@ WechatDiaryPlugin.__internals = {
   ILinkClient, respCode,
   parseImageAesKey, sniffImageExt, decryptAesEcb,
   INTENT, texts: { HELP_TEXT },
-  pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow,
+  pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow, canMergeIntoLastHeader,
 };
 
 module.exports = WechatDiaryPlugin;
