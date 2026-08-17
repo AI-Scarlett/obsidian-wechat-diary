@@ -67,7 +67,7 @@ source: wechat-diary
 
 完整规则见 [docs/data-contract.md](docs/data-contract.md): 只追加、北京时间(时区可配)、一次发送 = 一个 `\n\n` 分隔块 = 一条消息、「结束」写封存注脚。自契约 v1.2 起, 一天的边界是凌晨 4 点——4 点前的记录落在前一天的文件里。
 
-与 Python 版 [wechat-diary](https://github.com/ArtemisLin/wechat-diary) 产出的文件遵循同一契约, 两种形态可随时互迁。
+前身 Python 常驻版 [wechat-diary](https://github.com/ArtemisLin/wechat-diary) 已归档(2026-08), 它写出的库遵循同一契约, 本插件可直接接着写。
 
 ## License
 
