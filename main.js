@@ -11,6 +11,19 @@
  * bot token 与 AI Key 存 Obsidian 密钥存储(不进 vault, 不被同步盘带走)。
  *
  * 文件结构: [内嵌 qrcode-generator 库] → [插件本体] → module.exports。
+ *
+ * Copyright (C) 2026 ArtemisLin
+ * SPDX-License-Identifier: AGPL-3.0-only
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, version 3.
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+ * for more details: <https://www.gnu.org/licenses/agpl-3.0.html>.
+ * 商业授权(闭源使用)请联系作者: https://github.com/ArtemisLin/obsidian-wechat-diary
+ * (内嵌的 qrcode-generator 保持其原有 MIT 授权, 见下方声明。)
  */
 //---------------------------------------------------------------------
 //

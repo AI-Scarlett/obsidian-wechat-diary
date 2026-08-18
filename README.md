@@ -71,4 +71,12 @@ source: wechat-diary
 
 ## License
 
-[MIT](LICENSE)
+本项目采用 **双许可(dual licensing)** 模式, 版权归作者 ArtemisLin 所有:
+
+- **开源许可: [GNU AGPL-3.0](LICENSE)**。你可以自由使用、修改、再分发, 但任何基于本项目的衍生作品——包括魔改版插件, 也包括把它改造成通过网络提供的服务——在分发或对外提供服务时, 必须以同样的 AGPL-3.0 协议公开完整源码。
+- **商业许可**。如果你想在闭源产品中使用本项目、或者不便遵守 AGPL 的义务, 请通过 [GitHub Issues](https://github.com/ArtemisLin/obsidian-wechat-diary/issues) 联系作者获取商业授权。
+
+说明:
+- v0.3.0 及之前的版本是按 MIT 协议发布的, 该授权对已获取的副本继续有效; 自 2026-08-18 起仓库中的代码及之后的所有版本改按上述条款授权。
+- 内嵌的 qrcode-generator 库版权归 Kazuhiko Arase, 保持其原有 MIT 授权。
+- 向本项目提交代码(PR)即表示你同意: 你的贡献以 AGPL-3.0 授权, 同时授予作者将其一并纳入商业许可版本的权利——否则双许可无法维持。
