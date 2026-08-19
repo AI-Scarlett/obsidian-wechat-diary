@@ -442,6 +442,31 @@ for channel plugins"）。自建客户端不会自动获得这层保护。
 
 ---
 
+## 8. 消息类型全景（2026-08-19 调查，源码级确证）
+
+> 背景: 公众号用户反馈"想把文件/聊天记录转发给 bot"。双路调查(官方包 2.4.6 src/ 逐行 + 社区 issues)结论如下。
+> npm 上 2.4.6 = latest(2026-06-22 起未更新, 出现「还维护吗」issue #259)。协议是纯 HTTP/JSON, 可独立调用。
+
+**收侧 MessageItemType 是封闭枚举 8 个值**(`src/api/types.ts:70-79`, "mirrors proto"):
+NONE=0, TEXT=1, IMAGE=2, VOICE=3, **FILE=4**, **VIDEO=5**, TOOL_CALL_START=11, TOOL_CALL_RESULT=12。
+
+| 类型 | 收 | 发 | 020 现状 | 备注 |
+|---|---|---|---|---|
+| 文本 1 | ✅ | ✅ | ✅ 在用 | 可带 ref_msg 引用(含被引用媒体的完整 CDN 引用) |
+| 图片 2 | ✅ | ✅ | 收✅ | 收侧有明文 fallback; 顶层 aeskey(hex) 优先 |
+| 语音 3 | ✅ | ❌(spec 有 VOICE=4 上传类型, 官方零实现) | 只用转写文本 | **voice_item.media 可下载原始 SILK 音频**——转写失败时可存原音频兜底(现在是让用户重说, 内容丢了) |
+| **文件 4** | ✅ | ✅ | **完全没用** | file_item{media, file_name, md5, len}, 官方实现下载解密上限 100MB。**解密同图片一套 AES-128-ECB, 但 key 编码不同**: 图片=base64(裸16字节), 文件/语音/视频=base64(32字符hex串) (`pic-decrypt.ts:31-52` parseAesKey)。⚠️ #193 大坑: **重复发同一文件必解密失败**(CDN 按内容寻址去重复用旧密文 blob, 但下发新随机 aes_key; 图片因顶层 aeskey 字段免疫)——可用 md5 字段解: 解密失败时查本地已收文件的 md5, 命中即复用。⚠️ #82: 发侧中文文件名静默丢失 |
+| **视频 5** | ✅ | ✅ | **完全没用** | video_item 带 play_length/video_md5/缩略图 |
+| 链接/公众号卡片 | ❌ | ❌ | — | **协议 spec 无此类型**(微信底层 MsgType 49 AppMsg 无对应槽位); OpenClaw 主仓 #52086 "silently dropped", closed as not planned |
+| 聊天记录合并转发 | ❌ | ❌ | — | 协议无类型; 且**手机转发列表根本选不到 bot**(#198, UI 层限制, 社区判断: 这本质=聊天记录导出, 微信长期拒绝) |
+| 位置/名片 | ❌ | ❌ | — | 协议无类型 |
+
+**给用户的答复口径**: ①转发(文件/聊天记录/文章)给 bot → 微信不让(转发列表选不到它), 腾讯侧限制, 插件无能为力; ②但在**和 bot 的对话框里直接发文件**协议完全支持, 是 020 自己还没实现(main.js 那行 `// 文件/视频等, 日记场景仍忽略`)——可以做。
+
+**其他没用上的协议能力**: sendTyping「正在输入」(getconfig 取 typing_ticket, status 1/2 开关); TOOL_CALL 进度气泡; GetUpdatesResp.longpolling_timeout_ms 服务端建议超时(官方动态采纳); 发侧 sendWeixinMediaFile 可把任意文件发回给用户。
+
+**风险注记**: ⚠️ 服务端能力会悄悄回收的先例——语音气泡曾可用后失效(#209); 入站图片/视频被服务端压缩, 原图字段无效(#241), 影响病历照片 OCR 场景的画质预期。
+
 ## 附：原始实现位置
 
 | 内容 | 位置 |
