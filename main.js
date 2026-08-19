@@ -2366,6 +2366,9 @@ const DEFAULT_SETTINGS = {
   // 一天的边界(小时): 凌晨 4 点前记的都算前一天(契约 v1.2)。取代 v0.3.0 前的
   // 滚动宽限期(graceMinutes, 已退役)。暂无设置 UI, 要改的用户直接编辑 data.json。
   dayStartHour: 4,
+  // 夜间收尾提示的起点(小时): 当天第一条落在这个点之后的消息, 回执附一句"睡前说声「晚安」"。
+  // 与 dayStartHour 一样暂无 UI, 改 data.json 生效。
+  nudgeNightHour: 22,
 };
 
 // ── 北京时间工具(019 config.py 的教训: 禁止裸用宿主机本地时间)─────────
@@ -2403,6 +2406,17 @@ function logicalTodayStr(d) {
 function isNightNow(d) {
   const h = Number(hhmmStr(d).slice(0, 2));
   return h >= 20 || h < _dayStartHour;
+}
+// 夜间收尾提示用的"深夜"(默认 22 点起到逻辑日边界), 比收尾语的 20 点晚:
+// 20 点说晚安不违和, 但 20 点就提示"睡前跟我说声晚安"太早(2026-08-19 谷雨拍板)。
+let _nudgeNightHour = 22;
+function setNudgeNightHour(h) {
+  const n = Number(h);
+  _nudgeNightHour = Number.isFinite(n) && n >= 12 && n <= 23 ? Math.floor(n) : 22;
+}
+function isLateNight(d) {
+  const h = Number(hhmmStr(d).slice(0, 2));
+  return h >= _nudgeNightHour || h < _dayStartHour;
 }
 
 const WEEKDAY_CN = { Mon: "一", Tue: "二", Wed: "三", Thu: "四", Fri: "五", Sat: "六", Sun: "日" };
@@ -2458,9 +2472,10 @@ const HELP_TEXT = `✍️ 微信随手记 使用指南
 
 【命令】
 • 撤回 → 删掉刚记的最后一条
-• 结束 → 给今天写个收尾标记 (不发也没关系, 跨天会自动收尾)
+• 晚安 / 结束 → 给今天收个尾 (不发也没关系, 跨天会自动收尾)
 • 在吗 → 看我在不在、今天记了几段
 • 叫我XX → 设置/修改你的称呼
+• 记：xx → 把 xx 原样记下 (想把「晚安」这类会被当命令的词记进去时用)
 • 帮助 → 看到这条
 
 熬夜不怕跨天: 凌晨 4 点前记的都算前一天。
@@ -2469,6 +2484,8 @@ Obsidian 没开着也能发, 24 小时内下次打开会自动补记。`;
 // 老用户习惯发「开始记日记」: 友好告知不用了, 不落库
 const START_DIARY_OBSOLETE_REPLY = "现在不用特意开始啦~ 想记什么直接发就行 ✍️";
 const START_DIARY_SUSPECT_NOTE = "(顺便说, 现在不用发「开始记日记」了, 直接说就记)";
+// 「继续记录」的回执: 告知不用宣告, 顺便把「结束不影响继续记」讲清(用户多半刚「结束」过)
+const CONTINUE_REPLY = "直接发就行~ 我一直记着呢 ✍️ (「结束」只是收尾标记, 之后发的照样记)";
 
 // 图片相关文案
 const IMAGE_FAIL_REPLY = "这张图没存下来 😢 网络或格式的问题, 要不重发一次?";
@@ -2511,9 +2528,17 @@ function pingReply(n) {
 // 每天第一条的回执前缀: 零动作给足"它在且在记"的信任信号; 完整命令提示每天只在这出现一次
 const FIRST_OF_DAY_PREFIX = "今天第一条, 已开新的一页 📖\n";
 const FIRST_OF_DAY_TIPS = "\n(说错了发「撤回」, 随时发「帮助」看全部用法)";
+// 夜间收尾提示(2026-08-19 谷雨拍板): 把"怎么收尾"教在开头而不是中途打断——当天第一条落在深夜
+// (nudgeNightHour 起)的消息, 回执附一句; 一天一次、终身最多 3 次、用户手动收尾过一次就永久闭嘴。
+// 不按段数(段数多的恰是最不需要收尾的备忘录用户), 不做推送(bot 只在你说话时说话)。
+// n===1 时并进 FIRST_OF_DAY_TIPS 的位置——一条回执只挂一个括号。
+const NIGHT_SIGNOFF_TIP = "(睡前跟我说声「晚安」, 我给今天收个尾 🌙)";
+const FIRST_OF_DAY_TIPS_NIGHT = "\n(说错了发「撤回」; 睡前跟我说声「晚安」, 我给今天收个尾 🌙; 全部用法发「帮助」)";
+const NUDGE_LIFETIME_MAX = 3;
 
 const UNDO_EMPTY_REPLY = "今天还什么都没说呢, 没东西可撤哦";
 const FINALIZE_EMPTY_REPLY = "今天还没记东西呢~ 想记什么直接发";
+const FINALIZE_FAIL_REPLY = "⚠️ 收尾标记没写上! 写入出了问题, 等一会儿再试";
 // 跨天后的第一条: 昨天已自动封存的告知(会替掉 FIRST_OF_DAY_PREFIX, 两句语义重复)
 const GRACE_EXPIRED_NOTICE = "(昨天的已自动收尾, 翻开新的一页 📖)";
 
@@ -2537,13 +2562,91 @@ function randomClosing(name) {
   return head + "\n\n" + randomChoice(byePool);
 }
 
+// 告别语(晚安/我睡了/今天就到这/明天见)的回复: 回以同类, 不走「结束」的仪式池——
+// 说晚安想得到的是一句晚安; 段数就是句号("今天 N 段都收好了", pingReply 同款, 不算回顾)。
+// r = finalizeDay 的三态结果; 空日子 / 已封存无补记 → 只道别, 不接"想记什么直接发"。
+const SIGNOFF_SEALED_NIGHT = ["晚安 🌙 今天 {n} 段都收好了, 明天见", "好梦 🌙 今天的 {n} 段都收好了, 明天见"];
+const SIGNOFF_SEALED_NIGHT_NAME = ["晚安, {name} 🌙 今天 {n} 段都收好了, 明天见"];
+const SIGNOFF_SEALED_DAY = ["好~ 今天 {n} 段都收好了 📖 明天见 👋", "今天 {n} 段都收好了 📖 下次见 👋"];
+// 只有一段时"1 段都收好了"不通顺, 单独一套
+const SIGNOFF_SEALED_NIGHT_ONE = ["晚安 🌙 今天这一段收好了, 明天见", "好梦 🌙 今天的这一段收好了, 明天见"];
+const SIGNOFF_SEALED_NIGHT_NAME_ONE = ["晚安, {name} 🌙 今天这一段收好了, 明天见"];
+const SIGNOFF_SEALED_DAY_ONE = ["好~ 今天这一段收好了 📖 明天见 👋", "今天这一段收好了 📖 下次见 👋"];
+const SIGNOFF_ALREADY_NIGHT = "嗯, 补的也收好了, 晚安 🌙";
+const SIGNOFF_ALREADY_DAY = "嗯, 补的也收好了, 明天见 👋";
+const SIGNOFF_ONLY_NIGHT = "晚安 🌙 明天见";
+const SIGNOFF_ONLY_DAY = "好~ 明天见 👋";
+function fillTemplate(t, vars) {
+  let out = t;
+  for (const k of Object.keys(vars)) out = out.split("{" + k + "}").join(String(vars[k]));
+  return out;
+}
+function signoffReply(det, r, name, now) {
+  const night = !!(det && det.bedtime) || isNightNow(now);
+  if (!r || r.status === "error") return FINALIZE_FAIL_REPLY;
+  if (r.status === "sealed") {
+    const one = r.n === 1;
+    let pool = night ? (one ? SIGNOFF_SEALED_NIGHT_ONE : SIGNOFF_SEALED_NIGHT) : (one ? SIGNOFF_SEALED_DAY_ONE : SIGNOFF_SEALED_DAY);
+    if (night && name && Math.random() < 0.3) pool = one ? SIGNOFF_SEALED_NIGHT_NAME_ONE : SIGNOFF_SEALED_NIGHT_NAME;
+    return fillTemplate(randomChoice(pool), { n: r.n, name: name || "" });
+  }
+  if (r.status === "already" && r.afterSeal > 0) return night ? SIGNOFF_ALREADY_NIGHT : SIGNOFF_ALREADY_DAY;
+  return night ? SIGNOFF_ONLY_NIGHT : SIGNOFF_ONLY_DAY;
+}
+
+// 夜间收尾提示的决策(纯函数, 表驱动可测): 写成功且当天未封存、用户从没手动收尾过、
+// 终身提示 <3 次、现在是深夜、今天还没提示过 → 给一句。
+function nightSignoffTip(ctx) {
+  if (!ctx || !ctx.n || ctx.sealed) return null;
+  if ((ctx.finalizeCount || 0) > 0) return null;
+  if ((ctx.nudgeCount || 0) >= NUDGE_LIFETIME_MAX) return null;
+  if (!isLateNight(ctx.now)) return null;
+  if (ctx.nudgedDate && ctx.nudgedDate === logicalTodayStr(ctx.now)) return null;
+  return NIGHT_SIGNOFF_TIP;
+}
+
 // ── 意图识别(019 intents.py 移植 + 020「误切换吃内容」修复)──────────────
 
 const INTENT = { DIARY: "DIARY", FINALIZE: "FINALIZE", UNDO: "UNDO", HELP: "HELP", CHAT: "CHAT", START_DIARY: "START_DIARY" };
 
 const MAX_COMMAND_LEN = 15;
-const FINALIZE_KEYWORDS = new Set(["结束", "收尾", "收工", "打烊", "归档", "完了"]);
+const FINALIZE_KEYWORDS = new Set([
+  "结束", "收尾", "收工", "打烊", "归档",
+  // 完成态(2026-08-19): 「结束了」「记完了」是用户真会说的收尾话。「写完了」不收——待办用户拿它记完成状态。
+  // 019 传下来的光杆「完了」于 2026-08-19 移出: 它更常是感叹(「完了完了」「完了😭」), 尾部剥 emoji/复读折叠
+  // 上线后必被误吞; 标准同下: 可能是内容就不收。想收尾说「结束」。
+  "结束了", "记完了", "今天记完了", "说完了", "今天结束", "今天就结束",
+]);
+// 告别语=收尾(2026-08-19 谷雨拍板): 只收明确是对 bot 说的(第一人称/带「今天」/对话式)。光杆「睡了」「睡觉了」
+// 「先这样」「就这样」「到此为止」「拜拜」「再见」都不收——记爸妈病历/宝宝作息的用户会拿前两个当状态记,
+// 后几个可能是情绪句; 标准同「在吗」: 可能是内容就不收。想把「晚安」当内容记: 「记：晚安」。
+// 「X啦」= 「X了」的合音, 匹配时等价处理(见 detectIntent), 不必在表里重复列。
+const BEDTIME_KEYWORDS = new Set([
+  "晚安", "晚安了", "我睡了", "我去睡了", "去睡了", "去睡觉了", "睡觉去了", "我睡觉去了", "我去睡觉了", "我睡觉了",
+  "我要睡了", "我要睡觉了", "我先睡了", "我先去睡了", "我该睡了", "晚安明天见",
+]);
+const SIGNOFF_KEYWORDS = new Set([
+  ...BEDTIME_KEYWORDS,
+  "今天就到这", "今天就到这里", "今天就到这儿", "今天先到这", "今天先到这里", "今天先到这儿",
+  "明天见",
+]);
 const UNDO_KEYWORDS = new Set(["撤回", "删掉", "删除", "撤销", "删掉上一段", "删掉上条", "撤回上一段"]);
+// 「撤回/撤销/删掉/删除」开头放行的尾巴: 复读(语音「撤回撤回撤回这一段」)与指代。「撤回申请」「撤销订阅」
+// 「删掉了一些旧照片」是内容, 必须照记——误记能撤, 误删救不回(2026-08-19 收紧, 原先 startsWith 全放行)。
+const UNDO_TAILS = new Set([
+  "", "一下", "下", "掉", "一条", "一段", "上一条", "上一段", "上条", "上一句", "上一个", "这一段", "这段", "这条", "这句", "这个",
+  "那条", "那段", "那个", "上面", "上面的", "上面那条", "上面那段", "上面那句", "上面那个",
+  "刚才", "刚刚", "刚才的", "刚刚的", "刚才发的", "刚刚发的", "刚发的", "刚才那条", "刚才那段", "刚才那句", "刚才那个",
+  "刚才这条", "刚刚那条", "刚刚那段", "刚刚那个", "最后一条", "最后一段", "最后那条", "前一条", "前一段",
+]);
+// 前置应答词(「好，结束」「嗯 撤回」「那结束吧」「OK 结束」「好结束」「好的好的晚安」): 最多剥 3 层, 剥掉后只做
+// 词表精确匹配, 不走任何前缀兜底——「好早」「那完了」「好的撤销了订单」都留在内容侧。长的在前(正则按顺序取)。
+const LEAD_ACK_RE = /^(好的呀|好的|好了|好啦|好吧|好嘞|好呀|好啊|好哦|好哈|好滴|嗯呐|嗯+|那就|那|好+|行+|okay|ok)([,，。.!！?？~～、\s]*)/;
+const LEAD_ACK_MAX = 3;
+// 多段告别(「晚安 晚安」「晚安，明天见」「结束 晚安」): 按分隔符切段, 每段都得是收尾/告别词才算
+const SEGMENT_SEP_RE = /[,，、;；。.!！?？~～\s]+/;
+// 「记：xx」逃生口: xx 原样落库, 不管它是不是命令词(与「撤回」对称: 一个救误记, 一个救误吞)
+const FORCE_RECORD_RE = /^记[：:]\s*/;
 const HELP_KEYWORDS = new Set(["/help", "help", "帮助", "怎么用", "使用说明", "菜单"]);
 // 探活/寒暄词表: 这些是 ping, 不是内容——回状态、不落库(v0.3.0 单模式下的关键闸门)
 const CHAT_GREETING_KEYWORDS = new Set([
@@ -2560,9 +2663,16 @@ const START_DIARY_KEYWORDS = new Set([
 ]);
 // 故意不含单字「开始」, 避免「今天工作开始得很早」误触发
 const START_DIARY_PHRASES = ["开始记日记", "开始记录", "开始写日记", "我们记日记"];
+// 「结束」之后用户会宣告「继续记录」(2026-08-19 谷雨实测第一反应)——和「开始记日记」同类:
+// 对 bot 说的话, 不是内容。只收光杆短句; 「明天继续记录血压」是内容(精确匹配, 不做包含判断)。
+const CONTINUE_KEYWORDS = new Set([
+  "继续", "继续记", "继续记录", "继续写", "继续记日记", "继续写日记",
+  "接着记", "接着记录", "接着写", "我要继续记", "我继续记",
+]);
 
-const STRIP_CHARS = new Set([..."。!?!?,,、~ \t\n　"]);
-const TAIL_PARTICLES = ["吧", "啊", "啦", "呀", "哦", "嘛", "呗", "哈"];
+// 半角+全角都要有(2026-08-19 修: 原来两组都是半角, 「叫我小明！」会把感叹号存进名字)
+const STRIP_CHARS = new Set([..."。!?！？,，、;；:：~～ \t\n　"]);
+const TAIL_PARTICLES = ["吧", "啊", "啦", "呀", "哦", "嘛", "呗", "哈", "咯", "喽", "呐", "哟", "呢"];
 
 function rstripChars(s, charSet) {
   const arr = [...s];
@@ -2571,49 +2681,155 @@ function rstripChars(s, charSet) {
   return arr.slice(0, end).join("");
 }
 
+// 尾部噪音: 标点、符号、emoji(「晚安🌙」「撤回❌」「结束。。」都要认); 头部只剥引号括号与 emoji(「结束」「🌙晚安」)。
+// 不用 /[…]+$/ 正则(长符号串上是二次方回溯), 逐码点回退, 线性。书名号《》不剥: 「《晚安》」是在记一首歌。
+const NOISE_CH_RE = /^[\p{P}\p{S}\p{Extended_Pictographic}️‍\s]$/u;
+const LEAD_STRIP_CH_RE = /^[「『【"'“‘（(\[\s\p{Extended_Pictographic}️‍]$/u;
+function stripNoise(s) {
+  const arr = [...rstripChars(s, STRIP_CHARS)];
+  let end = arr.length;
+  while (end > 0 && NOISE_CH_RE.test(arr[end - 1])) end--;
+  let start = 0;
+  while (start < end && LEAD_STRIP_CH_RE.test(arr[start])) start++;
+  return arr.slice(start, end).join("");
+}
+
 function normalizeIntent(text) {
   let s = (text || "").trim().split("　").join(" ");
-  s = rstripChars(s, STRIP_CHARS).trimStart().toLowerCase();
+  s = stripNoise(s).trimStart().toLowerCase();
   // 循环剥尾部语气词: 语气词后可能还有标点(「开始记日记吧。」)
   for (;;) {
     let changed = false;
     for (const p of TAIL_PARTICLES) {
       if (s.length > p.length && s.endsWith(p)) { s = s.slice(0, s.length - p.length); changed = true; break; }
     }
-    s = rstripChars(s, STRIP_CHARS);
+    s = stripNoise(s);
     if (!changed) break;
   }
   return s;
 }
 
-// 返回 { intent, suspect }。suspect=true 表示长句中出现开始短语(020 修复:
-// 019 会把「从下个月开始记录我的开销」整句当切换指令且丢句; 020 切换同时把原句写入)。
+// 一个短句的各种"等价形态", 词表查找时都试一遍(纯查表, 不做前缀匹配):
+//   norm(剥噪音+尾部语气词) / base(只剥噪音, 保住「在嘛」「来啦」这种词本身带语气字的) / 各自的复读折叠 /
+//   「X啦」→「X了」(「我睡啦」=「我睡了」)。返回去重后的候选数组。
+function intentForms(raw) {
+  const norm = normalizeIntent(raw);
+  const base = stripNoise((raw || "").trim().split("　").join(" ")).trimStart().toLowerCase();
+  const forms = new Set([norm, base, foldRepeats(norm), foldRepeats(base)]);
+  const la = base.endsWith("啦") && !norm.endsWith("啦"); // 「我睡啦」: 尾部「啦」被当语气词剥掉了, 补一个「了」形态
+  if (la) forms.add(norm + "了");
+  forms.delete("");
+  return { norm, base, la, forms: [...forms] };
+}
+function hitAny(set, forms) { return forms.some((f) => set.has(f)); }
+
+// 返回 { intent, suspect?, signoff?, bedtime?, forced?, viaAck? }:
+// signoff=告别语触发的 FINALIZE(回复走 signoffReply); bedtime=睡觉类(晚安池);
+// forced=「记：」逃生口(写入方剥前缀原样落库); viaAck=靠剥前置应答词/多段拼接才命中(仅供测试/日志)。
 function detectIntent(text) {
   const raw = (text || "").trim();
   if (!raw) return { intent: INTENT.DIARY };
-  const norm = normalizeIntent(raw);
+  if (FORCE_RECORD_RE.test(raw)) return { intent: INTENT.DIARY, forced: true };
   const cp = codePointLen(raw);
   if (START_DIARY_PHRASES.some((p) => raw.includes(p))) {
-    if (cp <= MAX_COMMAND_LEN || START_DIARY_KEYWORDS.has(norm)) return { intent: INTENT.START_DIARY };
+    if (cp <= MAX_COMMAND_LEN || START_DIARY_KEYWORDS.has(normalizeIntent(raw))) return { intent: INTENT.START_DIARY };
     return { intent: INTENT.START_DIARY, suspect: true };
   }
-  if (cp > MAX_COMMAND_LEN) return { intent: INTENT.DIARY };
-  if (FINALIZE_KEYWORDS.has(norm)) return { intent: INTENT.FINALIZE };
-  if (UNDO_KEYWORDS.has(norm)) return { intent: INTENT.UNDO };
-  // 语音转写「撤回撤回撤回这一段」兜底; 只放行这两个前缀(「删掉了一些旧照片」是日记)
-  if (norm.startsWith("撤回") || norm.startsWith("撤销")) return { intent: INTENT.UNDO };
-  if (HELP_KEYWORDS.has(norm)) return { intent: INTENT.HELP };
-  if (START_DIARY_KEYWORDS.has(norm)) return { intent: INTENT.START_DIARY };
-  // 探活判定连复读一起认(「在吗在吗」→「在吗」): 微信急性子用户的高频形态
-  if (CHAT_GREETING_KEYWORDS.has(norm) || CHAT_GREETING_KEYWORDS.has(foldRepeats(norm))) return { intent: INTENT.CHAT };
+  // 长度闸门按剥完噪音的正文算: 「撤回！！！！！！！！！！！！！！」「晚安🌙🌙🌙」仍是命令
+  if (cp > MAX_COMMAND_LEN * 4) return { intent: INTENT.DIARY };
+  const { norm, la, forms } = intentForms(raw);
+  if (codePointLen(norm) > MAX_COMMAND_LEN) return { intent: INTENT.DIARY };
+  const r = matchCommand(forms, norm);
+  if (r) return r;
+  // 前置应答词剥壳: 「好，结束」「嗯 撤回」「那结束吧」「好的好的晚安」——最多剥 3 层, 每层剥后 rest 非空,
+  // 只做精确匹配, 不走任何前缀兜底。探活(在吗/早)只在带分隔符时可达: 「好，早」是招呼, 「好早」是内容。
+  let rest = norm, sep = false;
+  for (let i = 0; i < LEAD_ACK_MAX; i++) {
+    const m = LEAD_ACK_RE.exec(rest);
+    if (!m || m[0].length >= rest.length) break;
+    rest = rest.slice(m[0].length);
+    if (m[2]) sep = true;
+    const restForms = [rest, foldRepeats(rest)];
+    if (la) restForms.push(rest + "了"); // 「那我睡啦」
+    const rr = matchCommand(restForms, rest, { viaAck: true, allowChat: sep });
+    if (rr) return rr;
+  }
+  // 多段告别: 「晚安 晚安」「晚安，明天见」「结束 晚安」「好了，晚安，明天见」「我睡了晚安」——
+  // 切段后每段都得能被收尾/告别词表切干净, 总词数 ≥2 才算; 任何一段有词表外的字(「晚安 宝贝」)就是内容
+  const segs = norm.split(SEGMENT_SEP_RE).filter(Boolean);
+  if (segs.length >= 1 && segs.length <= 4) {
+    if (segs.length >= 2 && LEAD_ACK_RE.exec(segs[0]) && LEAD_ACK_RE.exec(segs[0])[0].length === segs[0].length) segs.shift();
+    const tokens = [];
+    let ok = true;
+    for (const seg of segs) {
+      const t = tokenizeClosing(seg);
+      if (!t) { ok = false; break; }
+      tokens.push(...t);
+    }
+    if (ok && tokens.length >= 2) {
+      const so = tokens.some((x) => SIGNOFF_KEYWORDS.has(x));
+      const bt = tokens.some((x) => BEDTIME_KEYWORDS.has(x));
+      return so ? { intent: INTENT.FINALIZE, signoff: true, bedtime: bt, viaAck: true } : { intent: INTENT.FINALIZE, viaAck: true };
+    }
+  }
   return { intent: INTENT.DIARY };
+}
+
+// 把一段话切成收尾/告别词(贪心最长匹配, 词间允许语气词/噪音字符); 切不干净返回 null。
+// 「我睡了晚安」→ ["我睡了","晚安"]; 「晚安啦晚安啦」→ ["晚安","晚安"]; 「晚安宝贝」→ null。词表里的「X了」也接受「X啦」。
+let _closingVocab = null;
+function closingVocab() {
+  if (!_closingVocab) {
+    const words = new Set([...FINALIZE_KEYWORDS, ...SIGNOFF_KEYWORDS]);
+    for (const w of [...words]) if (w.endsWith("了")) words.add(w.slice(0, -1) + "啦");
+    _closingVocab = [...words].sort((a, b) => codePointLen(b) - codePointLen(a));
+  }
+  return _closingVocab;
+}
+function tokenizeClosing(seg) {
+  const arr = [...seg];
+  const out = [];
+  let i = 0;
+  while (i < arr.length) {
+    let hit = null;
+    for (const w of closingVocab()) {
+      const wl = codePointLen(w);
+      if (arr.slice(i, i + wl).join("") === w) { hit = w; break; }
+    }
+    if (hit) { out.push(hit.endsWith("啦") ? hit.slice(0, -1) + "了" : hit); i += codePointLen(hit); continue; }
+    if (out.length && (TAIL_PARTICLES.includes(arr[i]) || NOISE_CH_RE.test(arr[i]))) { i++; continue; } // 词间语气词/噪音
+    return null;
+  }
+  return out.length ? out : null;
+}
+
+// 词表精确匹配(所有命令共用一套): forms 是候选形态, norm 给 isUndoPhrase 用
+function matchCommand(forms, norm, opts) {
+  const o = opts || {};
+  const tag = (r) => (o.viaAck ? Object.assign(r, { viaAck: true }) : r);
+  if (hitAny(FINALIZE_KEYWORDS, forms)) return tag({ intent: INTENT.FINALIZE });
+  if (hitAny(SIGNOFF_KEYWORDS, forms)) return tag({ intent: INTENT.FINALIZE, signoff: true, bedtime: hitAny(BEDTIME_KEYWORDS, forms) });
+  if (hitAny(UNDO_KEYWORDS, forms) || forms.some(isUndoPhrase)) return tag({ intent: INTENT.UNDO });
+  if (hitAny(HELP_KEYWORDS, forms)) return tag({ intent: INTENT.HELP });
+  if (!o.viaAck && START_DIARY_KEYWORDS.has(norm)) return { intent: INTENT.START_DIARY };
+  if (!o.viaAck && CONTINUE_KEYWORDS.has(norm)) return { intent: INTENT.START_DIARY, cont: true };
+  if ((!o.viaAck || o.allowChat) && hitAny(CHAT_GREETING_KEYWORDS, forms)) return tag({ intent: INTENT.CHAT });
+  return null;
+}
+
+// 「撤回/撤销/删掉/删除」开头: 复读或带指代尾巴才是命令(「撤回撤回撤回这一段」「撤销一下」「删掉刚才那条」);
+// 「撤回申请」「撤销订阅」「撤回来了」「删掉了一些旧照片」是内容
+function isUndoPhrase(norm) {
+  const m = /^(?:(?:撤回|撤销|删掉|删除)[吧啊啦呀哦嘛]?)+/.exec(norm);
+  if (!m) return false;
+  return UNDO_TAILS.has(norm.slice(m[0].length));
 }
 
 // ── 取名规则引擎(019 names.py 移植)─────────────────────────────────────
 
 const CALL_ME_MARKERS = ["叫我", "喊我", "称呼我", "称我"];
 const NEG_TOKENS = ["别", "不", "没", "勿", "咋", "怎么", "如何", "怎样"];
-const CLAUSE_SPLIT_RE = /[。．.!!??,,;;、\n]/;
+const CLAUSE_SPLIT_RE = /[。．.!！?？,，;；、\n]/;
 const REFUSALS = new Set([
   "不用", "不用了", "不需要", "不必", "随便", "随意", "都行", "都可以",
   "无所谓", "算了", "跳过", "不想说", "保密", "没有", "不告诉你",
@@ -3028,7 +3244,8 @@ class DiaryWriter {
     const voiceMark = isVoice ? "🎤 " : "";
     let reply = voiceMark + "记下来啦~ 今天第 " + n + " 段 ✍️";
     if (n === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
-    return { reply, n };
+    // sealed: 今天已有封存标记(夜间收尾提示据此闭嘴)
+    return { reply, n, sealed: finalContent.includes(CLOSING_MARKER) };
   }
 
   // 数今天(或指定日)已记的段数; 探活回执用。读不到按 0 算, 永不抛。
@@ -3070,7 +3287,7 @@ class DiaryWriter {
       // 图已经落盘了, 只是没插进笔记 —— 不删文件, 留给用户手动捞
       return { n: 0, diskFull: String(e && e.message).includes("ENOSPC") };
     }
-    return { n: countMessages(finalContent), diskFull: false };
+    return { n: countMessages(finalContent), diskFull: false, sealed: finalContent.includes(CLOSING_MARKER) };
   }
 
   // 撤回最后一条消息; 孤儿段头一并清理。返回是否删了东西。
@@ -3097,6 +3314,14 @@ class DiaryWriter {
           if (!tail || HEADER_FULL_RE.test(tail)) newParts.pop();
           else break;
         }
+        // 被删块之后的封存行要保住: 用户「晚安」封存后再「撤回」, 不能连句号一起撤掉(2026-08-19 修)。
+        // 例外: 撤光了(一条内容都不剩)就连封存行一起清, 空页不该留个"今日封存"。
+        if (newParts.some((b) => isMessageBlock(b.trim()))) {
+          for (const b of parts.slice(lastMsgI + 1)) {
+            const t = b.trim();
+            if (t.startsWith("---") || t.startsWith("_(")) newParts.push(t);
+          }
+        }
         let out = newParts.join("\n\n");
         if (out && !out.endsWith("\n")) out += "\n";
         ok = true;
@@ -3109,25 +3334,34 @@ class DiaryWriter {
     return { ok, removed: ok ? removed : null };
   }
 
-  // 封存。空文件 false; 已封存 true(幂等)。
+  // 封存。返回 { status, n, afterSeal }: status = "sealed"(这次真写了标记) | "already"(本来就有, 幂等不重写)
+  // | "empty"(今天没内容, 不写) | "error"; n=当天段数; afterSeal=封存线之后又补记的段数。
+  // 调用方据此区分: 跨天"自动收尾"告知只给没自己收尾的人; 告别语回"补的也收好了"还是只道别。
   async finalizeDay(dateStr) {
     const path = this.diaryPath(dateStr || logicalTodayStr());
     const vault = this.plugin.app.vault;
     const file = vault.getFileByPath(path);
-    if (!file) return false;
-    let ok = false;
+    if (!file) return { status: "empty", n: 0, afterSeal: 0 };
+    let status = "empty", n = 0, afterSeal = 0;
     try {
       await vault.process(file, (content) => {
         if (!content.trim()) return content;
-        ok = true;
-        if (content.includes(CLOSING_MARKER)) return content;
+        n = countMessages(content);
+        if (!n) return content; // 只剩 frontmatter/标题(全撤回了): 没东西可封
+        const idx = content.lastIndexOf(CLOSING_MARKER);
+        if (idx >= 0) {
+          status = "already";
+          afterSeal = countMessages(content.slice(idx));
+          return content;
+        }
+        status = "sealed";
         return content + "\n\n---\n" + CLOSING_MARKER + " " + hhmmStr() + ")_\n";
       });
     } catch (e) {
       console.error("[wechat-diary] 封存失败:", e);
-      return false;
+      return { status: "error", n, afterSeal };
     }
-    return ok;
+    return { status, n, afterSeal };
   }
 }
 
@@ -3438,16 +3672,18 @@ class DiaryAgent {
     const today = logicalTodayStr();
     if (!s.entered_date) { s.entered_date = today; return {}; }
     if (s.entered_date === today) return {};
-    // 逻辑日翻页: 自动封存旧的一天(空文件返回 false 无副作用), 真封了才告知
-    const sealed = await this.writer.finalizeDay(s.entered_date);
+    // 逻辑日翻页: 自动封存旧的一天(空文件无副作用)。只有这次真写了标记才告知"自动收尾"——
+    // 用户昨晚自己说了「晚安」/「结束」的, 句号已经给过了, 不能反过来说是自动收的(2026-08-19 修)
+    const r = await this.writer.finalizeDay(s.entered_date);
     s.entered_date = today;
-    return sealed ? { expiredNotice: GRACE_EXPIRED_NOTICE } : {};
+    return r && r.status === "sealed" ? { expiredNotice: GRACE_EXPIRED_NOTICE } : {};
   }
 
   async _writeEntry(text, isVoice, dateStr) {
     this.session.last_activity_ts = Date.now();
-    const { reply } = await this.writer.write(text, isVoice, dateStr);
-    return reply;
+    const res = await this.writer.write(text, isVoice, dateStr);
+    if (res.n) this._lastWrite = { n: res.n, sealed: !!res.sealed }; // 夜间收尾提示的依据
+    return res.reply;
   }
 
   // 下载并写入一批图片。一张失败不连累其余。
@@ -3455,7 +3691,7 @@ class DiaryAgent {
     this.session.last_activity_ts = Date.now();
     const client = this.plugin._client;
     if (!client) return IMAGE_FAIL_REPLY;
-    let ok = 0, failed = 0, lastN = 0, diskFull = false;
+    let ok = 0, failed = 0, lastN = 0, lastSealed = false, diskFull = false;
     for (const img of images) {
       try {
         const buf = await client.downloadImage(img);
@@ -3465,12 +3701,14 @@ class DiaryAgent {
         if (!res.n) { if (res.diskFull) diskFull = true; throw new Error("写入失败"); }
         ok += 1;
         lastN = res.n;
+        lastSealed = !!res.sealed;
       } catch (e) {
         failed += 1;
         console.error("[wechat-diary] 处理图片失败:", e && e.message);
       }
     }
     if (!ok) return diskFull ? IMAGE_DISK_FULL_REPLY : IMAGE_FAIL_REPLY;
+    this._lastWrite = { n: lastN, sealed: lastSealed };
     let reply = imageWrittenReply(lastN);
     if (lastN === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
     if (failed) reply = IMAGE_PARTIAL_TEMPLATE.split("{n}").join(String(failed)) + "\n\n" + reply;
@@ -3484,14 +3722,15 @@ class DiaryAgent {
       // 头一句就发图: 图先收下(内容优先), 再自我介绍
       profile.state = "awaiting_name";
       const imgReply = await this._writeImages(images);
-      return imgReply + "\n\n" + this._welcome();
+      // 开页 tips(撤回/帮助)与欢迎语正文重复, 只留欢迎语里那句
+      return imgReply.replace(FIRST_OF_DAY_TIPS, "") + "\n\n" + this._welcome();
     }
     return this._writeImages(images);
   }
 
   // 主业务路由(v0.3.0 单模式: 发什么记什么, 命令词是唯一例外; 闲聊分支整体退役)
-  async _handle(text, isVoice, cross) {
-    const det = detectIntent(text);
+  async _handle(text, isVoice, cross, det) {
+    det = det || detectIntent(text);
 
     if (det.intent === INTENT.HELP) return HELP_TEXT;
 
@@ -3506,12 +3745,19 @@ class DiaryAgent {
 
     if (det.intent === INTENT.FINALIZE) {
       // 封存降级为可选仪式: 写收尾标记, 不再切换任何模式; 之后继续发照样记
-      const ok = await this.writer.finalizeDay();
-      if (!ok) return FINALIZE_EMPTY_REPLY;
+      const r = await this.writer.finalizeDay();
+      // 用户说过收尾词(哪怕空日子)就记一笔: 说明会用了, 夜间收尾提示见到它永久闭嘴
+      if (r.status !== "error") this.profile.finalize_count = (this.profile.finalize_count || 0) + 1;
+      // 告别语(晚安/我睡了/今天就到这/明天见)回以同类; 「结束」保留仪式池
+      if (det.signoff) return signoffReply(det, r, this.profile.name || null);
+      if (r.status === "error") return FINALIZE_FAIL_REPLY;
+      if (r.status === "empty") return FINALIZE_EMPTY_REPLY;
       return randomClosing(this.profile.name || null);
     }
 
     if (det.intent === INTENT.START_DIARY) {
+      // 「继续记录」: 告知直接发就行, 不落库(2026-08-19 谷雨实测: 「结束」后第一反应是宣告继续)
+      if (det.cont) return CONTINUE_REPLY;
       // 老习惯兼容: 短句只告知"不用了"; 长句(suspect)里是内容, 整句照记不能丢
       if (det.suspect) {
         const writeReply = await this._writeEntry(text, isVoice);
@@ -3528,7 +3774,7 @@ class DiaryAgent {
 
     // 显式「叫我XX」短句 → 改称呼。只对命令长度的短句生效:
     // 「叫我妈过来吃饭」这类以"叫我"开头的长句是内容, 必须照记(单模式新增的守卫)
-    if (codePointLen((text || "").trim()) <= MAX_COMMAND_LEN) {
+    if (!det.forced && codePointLen((text || "").trim()) <= MAX_COMMAND_LEN) {
       const newName = extractExplicitName(text);
       if (newName) {
         this.profile.name = newName;
@@ -3537,31 +3783,43 @@ class DiaryAgent {
       }
     }
 
-    return this._writeEntry(text, isVoice);
+    // 「记：xx」逃生口: 剥掉前缀, xx 原样落库
+    return this._writeEntry(det.forced ? (text || "").trim().replace(FORCE_RECORD_RE, "") : text, isVoice);
   }
 
   // 首次见面 + 取名"一轮即过"(v0.3.0)。取名永不吞内容:
   // 认得出名字才当名字, 认不出=它是内容, 照记 + 提示称呼可后设; 只问这一轮, 不当拦路虎。
   async _dispatch(text, isVoice, images) {
+    const now = new Date();
     const cross = await this._loadOrReset();
     const profile = this.profile;
     const hasText = !!(text || "").trim();
+    const wasActive = profile.state === "active"; // 首次见面/取名轮不挂夜间提示(欢迎语已经够长)
+    const det = hasText ? detectIntent(text) : { intent: INTENT.DIARY };
+    this._lastWrite = null; // 本轮有没有写成功、写完是否已封存——夜间收尾提示的依据
+    this._pendingNudge = null; // 本轮回执带了夜间提示, 等发送成功后由 commitNudge 落账
 
     let reply;
+    // 「晚安」+图片同条: 图先落库再收尾, 否则图掉在封存线下面、回执"3 段都收好了"紧接"第 4 段"自相矛盾
+    let imgFirstReply = null;
+    if (hasText && images.length && det.intent === INTENT.FINALIZE && profile.state === "active") {
+      imgFirstReply = await this._writeImages(images);
+      images = [];
+    }
     if (!hasText && images.length) {
       reply = await this._handleImageOnly(images, cross);
     } else if (profile.state === "unknown" || !profile.state) {
       profile.state = "awaiting_name";
-      if (detectIntent(text).intent === INTENT.DIARY) {
+      if (det.intent === INTENT.DIARY) {
         // 第一句就是内容: 先记下(内容优先), 再自我介绍
-        const writeReply = await this._handle(text, isVoice, cross);
-        reply = (writeReply ? writeReply + "\n\n" : "") + this._welcome();
+        const writeReply = await this._handle(text, isVoice, cross, det);
+        // 开页 tips(撤回/帮助)与欢迎语正文重复, 只留欢迎语里那句
+        reply = (writeReply ? writeReply.replace(FIRST_OF_DAY_TIPS, "") + "\n\n" : "") + this._welcome();
       } else {
         reply = this._welcome(); // 第一句是探活/命令: 欢迎语本身就是回答
       }
     } else if (profile.state === "awaiting_name") {
-      const det = detectIntent(text);
-      if (det.intent === INTENT.DIARY) {
+      if (det.intent === INTENT.DIARY && !det.forced) {
         const { name: extracted, refused } = extractName(text);
         if (refused) {
           profile.state = "active";
@@ -3572,16 +3830,16 @@ class DiaryAgent {
           reply = NAME_CONFIRM_TEMPLATE.split("{name}").join(extracted);
         } else {
           profile.state = "active"; // 不像名字 → 它是内容, 记下; 取名只问一轮
-          reply = await this._handle(text, isVoice, cross);
+          reply = await this._handle(text, isVoice, cross, det);
           if (reply) reply += "\n\n" + NAME_LATER_HINT;
         }
       } else {
-        profile.state = "active"; // 命令照常执行, 取名放行不再纠缠
-        reply = await this._handle(text, isVoice, cross);
+        profile.state = "active"; // 命令照常执行(「记：」强制落库也走这), 取名放行不再纠缠
+        reply = await this._handle(text, isVoice, cross, det);
         if (reply) reply += "\n\n" + NAME_LATER_HINT;
       }
     } else {
-      reply = await this._handle(text, isVoice, cross);
+      reply = await this._handle(text, isVoice, cross, det);
     }
 
     // 图文同条: 微信通常拆成两条发, 但协议允许一条里既有 text 又有 image。
@@ -3590,9 +3848,26 @@ class DiaryAgent {
       const imgReply = await this._writeImages(images);
       reply = reply ? reply + "\n\n" + imgReply : imgReply;
     }
+    if (imgFirstReply) reply = reply ? imgFirstReply + "\n\n" + reply : imgFirstReply;
 
-    if (reply && cross.expiredNotice) {
-      // 跨天告知与「今天第一条」语义重复, 只留前者(告知在前, §3.3)
+    // 夜间收尾提示: 当天第一条深夜消息的回执附一句"睡前说声「晚安」"(决策在 nightSignoffTip)。
+    // 跨天告知那条不挂(两个括号、"收尾"说两遍), 顺延到今天下一条深夜消息。
+    // 计数不在这里落: 回执真发出去了才算说过(见 commitNudge / _handleIncoming), 发不出去不烧额度。
+    const willNotice = !!(cross.expiredNotice && !det.signoff);
+    if (reply && wasActive && this._lastWrite && !willNotice) {
+      const tip = nightSignoffTip({
+        n: this._lastWrite.n, sealed: this._lastWrite.sealed, now,
+        nudgedDate: this.session.nudged_date, nudgeCount: profile.nudge_count, finalizeCount: profile.finalize_count,
+      });
+      if (tip) {
+        this._pendingNudge = { date: logicalTodayStr(now) };
+        // 开页那条已经挂了一个括号(撤回/帮助): 并成一句, 一条回执只挂一个括号
+        reply = reply.includes(FIRST_OF_DAY_TIPS) ? reply.replace(FIRST_OF_DAY_TIPS, FIRST_OF_DAY_TIPS_NIGHT) : reply + "\n\n" + tip;
+      }
+    }
+
+    // 跨天告知: 与「今天第一条」语义重复, 只留前者(告知在前, §3.3); 告别语回执不挂——刚道别就说"翻开新的一页"别扭
+    if (reply && cross.expiredNotice && !det.signoff) {
       reply = cross.expiredNotice + "\n\n" + reply.replace(FIRST_OF_DAY_PREFIX, "");
     }
     return reply;
@@ -3609,6 +3884,16 @@ class DiaryAgent {
     }
     await this.plugin.persist();
     return reply;
+  }
+
+  // 回执真送达了才把夜间提示记账(一天一次 + 终身 3 次)。返回是否落了账(调用方据此 persist)。
+  commitNudge() {
+    const pn = this._pendingNudge;
+    if (!pn) return false;
+    this._pendingNudge = null;
+    this.session.nudged_date = pn.date;
+    this.profile.nudge_count = (this.profile.nudge_count || 0) + 1;
+    return true;
   }
 }
 
@@ -3976,8 +4261,10 @@ const DEFAULT_DATA = () => ({
     contextTokens: {}, recentSeqs: [], pauseUntil: 0, lastAliveTs: 0, loginTime: "",
     botTokenFallback: "", skipBacklog: false,
   },
-  profile: { state: "unknown", name: null },
-  session: { mode: "chat", entered_date: "", chat_count_today: 0, last_activity_ts: 0, cost_reminder_shown_date: "" },
+  // finalize_count: 手动收尾(结束/晚安)过几次; nudge_count: 夜间收尾提示说过几次(终身)——都是"这个人的习惯", 跟 profile 走
+  profile: { state: "unknown", name: null, finalize_count: 0, nudge_count: 0 },
+  // nudged_date: 夜间收尾提示今天说过没有(逻辑日)
+  session: { mode: "chat", entered_date: "", chat_count_today: 0, last_activity_ts: 0, cost_reminder_shown_date: "", nudged_date: "" },
 });
 
 class WechatDiaryPlugin extends Plugin {
@@ -3993,6 +4280,7 @@ class WechatDiaryPlugin extends Plugin {
     this.settings = this.data.settings;
     setTimezone(this.settings.timezone);
     setDayStartHour(this.settings.dayStartHour);
+    setNudgeNightHour(this.settings.nudgeNightHour);
 
     // data.json 丢了但 token 还在(卸载重装/同步盘回滚)时, 从 secret 里把身份取回来。
     // 顺序在 setTimezone 之后、管道启动之前, 让后面所有判断看到的都是补全过的状态。
@@ -4414,6 +4702,7 @@ class WechatDiaryPlugin extends Plugin {
       if (this._isPaused() || !this._client) return;
       try {
         await this._client.sendText(from, reply, il.contextTokens[from]);
+        if (this.agent.commitNudge()) await this.persist();
       } catch (e) {
         if (e && e.ilinkCode === STALE_TOKEN_ERRCODE) {
           il.pauseUntil = Date.now() + SESSION_PAUSE_MS;
@@ -4432,8 +4721,9 @@ WechatDiaryPlugin.__internals = {
   todayStr, hhmmStr, weekdayForDate, yesterdayStr, setTimezone,
   ILinkClient, respCode,
   parseImageAesKey, sniffImageExt, decryptAesEcb,
-  INTENT, texts: { HELP_TEXT },
+  INTENT, texts: { HELP_TEXT, NIGHT_SIGNOFF_TIP, FIRST_OF_DAY_PREFIX, FIRST_OF_DAY_TIPS, FIRST_OF_DAY_TIPS_NIGHT, FINALIZE_EMPTY_REPLY, FINALIZE_FAIL_REPLY, GRACE_EXPIRED_NOTICE, CLOSING_MARKER },
   pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow, canMergeIntoLastHeader,
+  isUndoPhrase, signoffReply, nightSignoffTip, setNudgeNightHour, isLateNight, DiaryWriter,
 };
 
 module.exports = WechatDiaryPlugin;
