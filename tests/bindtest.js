@@ -570,6 +570,199 @@ async function newPlugin(secrets, storedData) {
   const wr = await W.write("再来一条", false, DAY);
   check("光标题文件续写正常, sealed=false", wr.n === 1 && wr.sealed === false && files[path] !== before29);
 
+
+  // ══ D10 (2026-08-19 谷雨拍板): 每日提醒 + 语音兜底 + 文件/视频接收 ══════════
+
+  console.log("\n【30】每日提醒: reminderDue 纯函数(表驱动)");
+  I.setDayStartHour(4);
+  const RD = (o) => I.reminderDue(Object.assign({ enabled: true, timeStr: "21:30", now: new Date("2026-08-16T21:35:00+08:00"), countToday: 0, remindedDate: "", streak: 0 }, o));
+  check("到点+没记+没提醒过 → 发", RD({}) === true);
+  check("还没到点(21:29) → 不发", RD({ now: new Date("2026-08-16T21:29:00+08:00") }) === false);
+  check("今天记过了 → 不发", RD({ countToday: 2 }) === false);
+  check("今天提醒过了 → 不发", RD({ remindedDate: "2026-08-16" }) === false);
+  check("窗口开到凌晨: 01:00 仍是同一逻辑日 → 已提醒不重发", RD({ now: new Date("2026-08-17T01:00:00+08:00"), remindedDate: "2026-08-16" }) === false);
+  check("昨天提醒的 → 今天照发", RD({ remindedDate: "2026-08-15" }) === true);
+  check("连续 3 天没写 → 闭嘴", RD({ streak: 3 }) === false);
+  check("关掉 → 不发", RD({ enabled: false }) === false);
+  check("时间格式错 → 不发", RD({ timeStr: "乱写" }) === false && RD({ timeStr: "25:00" }) === false);
+  check("夜猫子设 01:00: 23:00 还没到", RD({ timeStr: "01:00", now: new Date("2026-08-16T23:00:00+08:00") }) === false);
+  check("夜猫子设 01:00: 01:30 到了(逻辑日还是 16 号)", RD({ timeStr: "01:00", now: new Date("2026-08-17T01:30:00+08:00") }) === true);
+  check("文案轮流不重样", I.reminderText(0) !== I.reminderText(1) && I.reminderText(0) === I.reminderText(I.texts2.REMINDER_LINES.length));
+  const TRE = I.texts2.REMINDER_TIME_RE;
+  check("时间正则: 合法", TRE.test("21:30") && TRE.test("8:05") && TRE.test("04:00") && TRE.test("23:59") && TRE.test("0:00"));
+  check("时间正则: 越界/半截拒收(设置页与 reminderDue 同规则)", !TRE.test("24:30") && !TRE.test("25:00") && !TRE.test("21:75") && !TRE.test("8:5") && !TRE.test("21:"));
+
+  console.log("\n【31】每日提醒: _reminderTick 全链路(桩 client)");
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  const sentReminders = [];
+  p._running = true;
+  p._pollSettledTs = Date.now();
+  p._client = { sendText: async (to, text) => { sentReminders.push(text); } };
+  p.settings.reminderTime = I.hhmmStr(); // 设成"现在", 保证到点
+  I.setDayStartHour(4);
+  await p._reminderTick();
+  check("发出提醒", sentReminders.length === 1, JSON.stringify(sentReminders));
+  check("提醒文案来自轮换池", I.texts2.REMINDER_LINES.includes(sentReminders[0]), sentReminders[0]);
+  check("记账: reminded_date/streak/idx/last_result", p.data.session.reminded_date === I.logicalTodayStr(new Date()) && p.data.session.reminder_streak === 1 && p.data.session.reminder_idx === 1 && p.data.session.reminder_last_result.startsWith("ok"), JSON.stringify(p.data.session));
+  await p._reminderTick();
+  check("同一天不再发", sentReminders.length === 1);
+  await p.agent._dispatch("回来记一条", false, []);
+  check("用户一写东西 streak 清零", p.data.session.reminder_streak === 0);
+  await p._reminderTick();
+  check("记过之后当天也不会再发(countToday>0)", sentReminders.length === 1);
+  // 发送失败: 当天不重试, streak 不涨
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  p._running = true; p._pollSettledTs = Date.now();
+  p._client = { sendText: async () => { const e = new Error("发送失败 ret=-99"); e.ilinkCode = -99; throw e; } };
+  p.settings.reminderTime = I.hhmmStr();
+  await p._reminderTick();
+  check("失败也记账(一天只试一次), streak 不涨", p.data.session.reminded_date === I.logicalTodayStr(new Date()) && p.data.session.reminder_streak === 0 && p.data.session.reminder_last_result.startsWith("fail"), p.data.session.reminder_last_result);
+  await p._reminderTick();
+  check("失败后当天不重试", p.data.session.reminder_last_result.split(" ")[0] === "fail");
+  // 各路闸门
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  const sent2 = [];
+  p._running = true; p._client = { sendText: async (t2, x) => sent2.push(x) };
+  p.settings.reminderTime = I.hhmmStr();
+  p._pollSettledTs = Date.now() - 10 * 60 * 1000;
+  await p._reminderTick();
+  check("拉取不新鲜(刚唤醒) → 不发", sent2.length === 0);
+  p._pollSettledTs = Date.now();
+  p.data.session.reminder_streak = 3;
+  await p._reminderTick();
+  check("streak=3 → 闭嘴", sent2.length === 0);
+  p.data.session.reminder_streak = 0;
+  p.settings.reminderEnabled = false;
+  await p._reminderTick();
+  check("开关关掉 → 不发", sent2.length === 0);
+  p.settings.reminderEnabled = true;
+  p._skipBacklog = true;
+  await p._reminderTick();
+  check("skipBacklog 恢复期 → 不发", sent2.length === 0);
+  p._skipBacklog = false;
+  await p._reminderTick();
+  check("闸门全开 → 发", sent2.length === 1);
+  check("老 data.json 缺提醒字段 → 默认补齐", (await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA())).data.session.reminder_streak === 0);
+  // 竞态: 提醒在途时用户消息插队写入 → streak 不能被反手写回(审稿轮抓出)
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  p._running = true; p._pollSettledTs = Date.now();
+  p.settings.reminderTime = I.hhmmStr();
+  p._client = { sendText: async () => { await p.agent._dispatch("提醒在途时插队的消息", false, []); } };
+  await p._reminderTick();
+  check("在途写入 → streak 保持 0(写入即清零不被覆盖)", p.data.session.reminder_streak === 0 && p.data.session.reminder_last_result.startsWith("ok"), JSON.stringify(p.data.session));
+  // 空日子说「晚安」→ 当天提醒也压掉(审稿轮抓出: 刚道晚安半小时又被催很荒唐)
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  p._running = true; p._pollSettledTs = Date.now();
+  const sent3 = [];
+  p._client = { sendText: async (to, x) => sent3.push(x) };
+  p.settings.reminderTime = I.hhmmStr();
+  await p.agent._dispatch("晚安", false, []);
+  check("道别后 reminded_date 落在今天", p.data.session.reminded_date === I.logicalTodayStr(new Date()));
+  await p._reminderTick();
+  check("道过晚安的空日子不再催记", sent3.length === 0);
+  // 重新扫码换管道 → _pollSettledTs 归零, 新 loop 完成一轮前不发(审稿轮抓出)
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  p._pollSettledTs = Date.now() - 30000; // 旧管道留下的"新鲜"值
+  p.startPipeline = Object.getPrototypeOf(p).startPipeline; // 用真方法验证归零
+  try { p.startPipeline(); } catch (e) {}
+  check("startPipeline 先归零 _pollSettledTs", p._pollSettledTs === 0, String(p._pollSettledTs));
+
+  console.log("\n【32】语音兜底: 转写失败存原音频");
+  check("SILK 嗅探", I.sniffAudioExt(Buffer.from("\x02#!SILK_V3xxxxxxxxxx", "binary")) === "silk");
+  check("mp3 嗅探", I.sniffAudioExt(Buffer.from("ID3xxxxxxxxxxxxx")) === "mp3");
+  check("认不出按 encode_type 兜底", I.sniffAudioExt(Buffer.from("????????????????"), 7) === "mp3" && I.sniffAudioExt(Buffer.alloc(4), 99) === "bin");
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  p._client = { downloadMedia: async () => Buffer.from("\x02#!SILK_V3" + "x".repeat(20), "binary") };
+  p.writer.attachmentPathNamed = (day, name) => "日记/attachments/2026/" + day + "-" + name;
+  p.writer.writeAttachment = async (buf, path, day, marker) => { calls.writes.push((marker ? marker + " " : "") + "![[" + path + "]]"); return { n: calls.writes.length, sealed: false, diskFull: false, path }; };
+  r = await p.agent._dispatch("", true, [], { voices: [{ encode_type: 6, media: { aes_key: "k" } }], files: [], videos: [] });
+  check("原音频落库(🎤 前缀块)", calls.writes.length === 1 && calls.writes[0].startsWith("🎤 ![[") && calls.writes[0].includes(".silk"), JSON.stringify(calls.writes));
+  check("回执讲清楚: 没转出文字+已存+可重说", r.includes("没转出文字") && r.includes("存下") && r.includes("再说一遍"), r);
+  p._client = { downloadMedia: async () => { throw new Error("网络挂了"); } };
+  r = await p.agent._dispatch("", true, [], { voices: [{ encode_type: 6, media: { aes_key: "k" } }], files: [], videos: [] });
+  check("下载失败 → 响亮, 请重说", r === I.texts2.VOICE_FALLBACK_FAIL_REPLY, r);
+
+  console.log("\n【33】文件/视频接收: md5 校验、重复复用(#193)、大小上限");
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  p.app.vault.getAbstractFileByPath = (path) => (String(path).includes("attachments") ? {} : null);
+  const fileBuf = Buffer.from("PDF 假内容 " + "x".repeat(100));
+  const fileMd5 = I.md5Hex(fileBuf);
+  let downloads = 0;
+  let nextBuf = fileBuf;
+  p._client = { downloadMedia: async () => { downloads++; return nextBuf; } };
+  p.writer.attachmentPathNamed = (day, name) => "日记/attachments/2026/" + day + "-" + name;
+  p.writer.writeAttachment = async (buf, path, day, marker) => { calls.writes.push("![[" + path + "]]"); return { n: calls.writes.length, sealed: false, diskFull: false, path }; };
+  p.writer.appendLinkBlock = async (path, day) => { calls.writes.push("reuse:![[" + path + "]]"); return { n: calls.writes.length, sealed: false }; };
+  const FI = { file_name: "检查报告.pdf", md5: fileMd5, len: String(fileBuf.length), media: { aes_key: "k" } };
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [FI], videos: [] });
+  check("文件落库, 回执带原名和段数", r.includes("「检查报告.pdf」收好啦") && calls.writes.length === 1 && downloads === 1, r);
+  check("md5 登记", p.data.ilink.fileMd5s.length === 1 && p.data.ilink.fileMd5s[0].md5 === fileMd5);
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [FI], videos: [] });
+  check("同 md5 再发 → 不下载, 直接引用(绕 #193)", downloads === 1 && calls.writes[1].startsWith("reuse:") && r.includes("之前收过"), r);
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [{ file_name: "另一份.pdf", md5: "0".repeat(32), len: "10", media: { aes_key: "k" } }], videos: [] });
+  check("md5 对不上 → 判为重复文件解密坑, 响亮+教改名", r === I.texts2.FILE_DUP_KEY_REPLY && calls.writes.length === 2 && downloads === 2, r);
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [{ file_name: "大.zip", md5: "1".repeat(32), len: String(200 * 1024 * 1024), media: { aes_key: "k" } }], videos: [] });
+  check("超 100MB → 不下载直接拒", r === I.texts2.FILE_TOO_BIG_REPLY && downloads === 2, r);
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [], videos: [{ video_md5: "2".repeat(32), video_size: String(200 * 1024 * 1024), media: { aes_key: "k" } }] });
+  check("超大视频 → 🎬 文案(不说文件)", r === I.texts2.VIDEO_TOO_BIG_REPLY, r);
+  const vidBuf = Buffer.from("视频假内容" + "y".repeat(50));
+  nextBuf = vidBuf;
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [], videos: [{ video_md5: I.md5Hex(vidBuf), video_size: String(vidBuf.length), media: { aes_key: "k" } }] });
+  check("视频照收", downloads === 3 && r.includes("🎬 视频收好啦"), r);
+  nextBuf = Buffer.from("不是那段视频");
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [], videos: [{ video_md5: "4".repeat(32), video_size: "10", media: { aes_key: "k" } }] });
+  check("视频 md5 不符 → 🎬 文案, 不教改名", r === I.texts2.VIDEO_DUP_KEY_REPLY && !r.includes("改个名"), r);
+  nextBuf = fileBuf;
+  // 晚安+文件同条: 文件先落库再收尾, 数字一致
+  const buf3 = Buffer.from("z".repeat(30));
+  nextBuf = buf3;
+  r = await p.agent._dispatch("晚安", false, [], { voices: [], files: [{ file_name: "睡前.pdf", md5: I.md5Hex(buf3), len: "30", media: { aes_key: "k" } }], videos: [] });
+  check("「晚安」+文件同条: 文件在前、收尾在后、数字一致", r.indexOf("睡前.pdf") < r.indexOf("段都收好了") && calls.finalized.length === 1, r);
+  // 撤回文案分型
+  check("撤回文件的文案", I.undoOkReply("![[日记/attachments/2026/a.pdf]]") === "好的, 撤掉了刚才那个文件");
+  check("撤回视频的文案", I.undoOkReply("![[日记/attachments/2026/a.mp4]]") === "好的, 撤掉了刚才那个视频");
+  check("撤回语音的文案", I.undoOkReply("🎤 ![[日记/attachments/2026/a.silk]]") === "好的, 撤掉了刚才那条语音");
+  check("撤回图片文案不变", I.undoOkReply("![[日记/attachments/2026/a.jpg]]") === "好的, 撤掉了刚才那张图片");
+  // attachmentPathNamed 消毒(真 writer)
+  const pw = (await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA())).writer;
+  const sane = pw.attachmentPathNamed("2026-08-19", '我的:报告|v1[f]#2.pdf');
+  check("原名消毒: 去毒字符保扩展名", sane.endsWith(".pdf") && !/[:|#\[\]]/.test(sane) && sane.includes("我的报告"), sane);
+  check("路径穿越只留 basename", !pw.attachmentPathNamed("2026-08-19", "../../evil.sh").includes(".."));
+  check("空名兜底 file.bin", pw.attachmentPathNamed("2026-08-19", "").endsWith("file.bin"));
+  check("毒字符吃掉 base 只剩扩展名 → 仍以 .pdf 结尾", pw.attachmentPathNamed("2026-08-19", "???.pdf").endsWith(".pdf"), pw.attachmentPathNamed("2026-08-19", "???.pdf"));
+  const longExt = pw.attachmentPathNamed("2026-08-19", "a." + "x".repeat(300));
+  check("超长假扩展名 → 整名压到文件系统限内", Buffer.byteLength(longExt.split("/").pop(), "utf8") < 200, String(Buffer.byteLength(longExt.split("/").pop(), "utf8")));
+  const longCjk = pw.attachmentPathNamed("2026-08-19", "报".repeat(120) + ".pdf");
+  check("超长中文名 → 压字节数且保扩展名", Buffer.byteLength(longCjk.split("/").pop(), "utf8") < 200 && longCjk.endsWith(".pdf"));
+  // 取名轮(awaiting_name)「晚安」+文件同条: 文件也要落在封存线之前(审稿轮抓出)
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => { const d = BOUND_DATA(); d.profile = { state: "awaiting_name", name: null }; return d; })());
+  calls = stubWriter(p);
+  const seq = [];
+  p._client = { downloadMedia: async () => fileBuf };
+  p.writer.attachmentPathNamed = (day, name) => "x/" + name;
+  p.writer.writeAttachment = async (buf, path) => { seq.push("write"); calls.writes.push(path); return { n: calls.writes.length, sealed: false, diskFull: false, path }; };
+  const origFinalize = p.writer.finalizeDay;
+  p.writer.finalizeDay = async (d) => { seq.push("seal"); return origFinalize(d); };
+  calls.writes.push("白天的一段");
+  r = await p.agent._dispatch("晚安", false, [], { voices: [], files: [{ file_name: "g.pdf", md5: fileMd5, len: "10", media: { aes_key: "k" } }], videos: [] });
+  check("取名轮「晚安」+文件: 先写文件再封存", seq.join(",") === "write,seal", seq.join(","));
+  // 磁盘满文案分型
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  p._client = { downloadMedia: async () => fileBuf };
+  p.writer.attachmentPathNamed = (day, name) => "x/" + name;
+  p.writer.writeAttachment = async () => ({ n: 0, sealed: false, diskFull: true, path: "" });
+  r = await p.agent._dispatch("", false, [], { voices: [], files: [{ file_name: "f.pdf", md5: fileMd5, len: "10", media: { aes_key: "k" } }], videos: [] });
+  check("文件磁盘满 → 「存附件失败」不说图片", r === I.texts2.ATTACH_DISK_FULL_REPLY, r);
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);

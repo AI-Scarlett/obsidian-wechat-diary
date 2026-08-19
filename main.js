@@ -2347,6 +2347,8 @@ const SECRET_BIND_ID = "wechat-diary-bind-identity";
 const LONG_POLL_TIMEOUT_MS = 35000;
 const SEND_TIMEOUT_MS = 15000;
 const MEDIA_TIMEOUT_MS = 60000;                // 图片下载: 手机拍的原图可能几 MB, 给足时间
+const MEDIA_TIMEOUT_LONG_MS = 300000;          // 文件/视频最大 100MB, 下载窗口给足
+const MAX_MEDIA_BYTES = 100 * 1024 * 1024;     // 协议上限(官方 WEIXIN_MEDIA_MAX_BYTES 同值)
 const MEDIA_MAX_BYTES = 100 * 1024 * 1024;     // 同官方 WEIXIN_MEDIA_MAX_BYTES
 const MEDIA_MAX_REDIRECTS = 3;                 // CDN 可能 302; Node https 不自动跟, 官方用的 fetch 会跟
 const NOTIFY_TIMEOUT_MS = 10000;
@@ -2369,6 +2371,9 @@ const DEFAULT_SETTINGS = {
   // 夜间收尾提示的起点(小时): 当天第一条落在这个点之后的消息, 回执附一句"睡前说声「晚安」"。
   // 与 dayStartHour 一样暂无 UI, 改 data.json 生效。
   nudgeNightHour: 22,
+  // 每日提醒(D10, 2026-08-19 谷雨拍板默认开): 到点时今天还什么都没记 → 微信上提醒一次。
+  reminderEnabled: true,
+  reminderTime: "21:30",
 };
 
 // ── 北京时间工具(019 config.py 的教训: 禁止裸用宿主机本地时间)─────────
@@ -2449,7 +2454,7 @@ function randHex(n) {
 function welcomeText(folder) {
   return `嗨~ 我是你的随手记 Agent ✍️
 
-想记什么直接发给我, 文字、语音、图片都行, 我会记到你今天的笔记里。
+想记什么直接发给我, 文字、语音、图片、文件都行, 我会记到你今天的笔记里。
 记的东西在 Obsidian 的「${folder}」文件夹; 想换地方: Obsidian 设置 → 第三方插件 → WeChat Diary → 日记文件夹。
 说错了发「撤回」, 随时发「帮助」看全部用法。
 
@@ -2467,7 +2472,7 @@ const NAME_MAX_LEN = 10;
 // 单模式使用指南。末段把"关着也不丢"讲给用户(缓冲窗口 24h 实测, 2026-08-16)
 const HELP_TEXT = `✍️ 微信随手记 使用指南
 
-想记什么直接发, 文字、语音、图片都行, 自动记到今天的笔记里。
+想记什么直接发, 文字、语音、图片、文件、视频都行, 自动记到今天的笔记里。
 不用任何开场白, 发出去就记下了。
 
 【命令】
@@ -2493,6 +2498,59 @@ const IMAGE_DISK_FULL_REPLY = "存图片失败! 磁盘可能满了 💾 请检�
 const IMAGE_PARTIAL_TEMPLATE = "(有 {n} 张没存下来, 可以重发一次)";
 function imageWrittenReply(n) {
   return "📷 图片收好啦~ 今天第 " + n + " 段 ✍️";
+}
+
+// 文件/视频/语音兜底(D10, 2026-08-19)。定位是笔记不是网盘, 但"发出去=记下了"对所有类型成立——静默扔掉肯定不行。
+const FILE_FAIL_REPLY = "📎 这个文件没收下来 😢 网络或解密的问题, 等一会儿重发试试";
+const FILE_DUP_KEY_REPLY = "📎 这个文件没收下来 😢 微信重复发送同一个文件时会给错密钥(它的毛病), 把文件改个名再发就好";
+const FILE_TOO_BIG_REPLY = "📎 这个文件太大了(超过 100MB 上限), 存不下 😢";
+const VIDEO_FAIL_REPLY = "🎬 这个视频没收下来 😢 网络或解密的问题, 等一会儿重发试试";
+// 视频没有文件名, 「改个名再发」不可执行——视频版文案分开写(审稿轮抓出)
+const VIDEO_DUP_KEY_REPLY = "🎬 这个视频没收下来 😢 微信重复发送同一段视频时会给错密钥(它的毛病), 稍后重发或改用文件方式发送试试";
+const VIDEO_TOO_BIG_REPLY = "🎬 这个视频太大了(超过 100MB 上限), 存不下 😢";
+// 磁盘满对语音/文件/视频不能说"存图片失败"(审稿轮抓出)
+const ATTACH_DISK_FULL_REPLY = "存附件失败! 磁盘可能满了 💾 请检查磁盘空间";
+function fileWrittenReply(name, n) { return "📎 「" + name + "」收好啦~ 今天第 " + n + " 段 ✍️"; }
+function videoWrittenReply(n) { return "🎬 视频收好啦~ 今天第 " + n + " 段 ✍️"; }
+function fileReusedReply(n) { return "📎 这份文件之前收过, 直接引用了原来那份~ 今天第 " + n + " 段 ✍️"; }
+function videoReusedReply(n) { return "🎬 这段视频之前收过, 直接引用了原来那份~ 今天第 " + n + " 段 ✍️"; }
+// 语音转写失败: 019/020 一直是"请重说"=内容丢了; 现在把原音频存下来("什么都别丢")
+const VOICE_FALLBACK_FAIL_REPLY = "🎤 这条语音微信没转出文字, 我想把原音频存下来也没成功 😢 再说一遍?";
+function voiceFallbackReply(n) { return "🎤 这条语音微信没转出文字, 原音频先存下了(今天第 " + n + " 段) ✍️ 想要文字版的话再说一遍也行"; }
+
+// ── 每日提醒(D10, 2026-08-19 谷雨拍板: 默认开、21:30、今天没记才提醒、文案轮流、连续 3 天没写就闭嘴)──
+// 019 的教训(D3): _is_token_fresh 的"20 小时窗口"是编的, 判定不新鲜连试都不试。
+// 020 原则: 到点就发、不做任何预判、按返回码记录——真实送达窗口只能发着发着才知道。
+const REMINDER_STREAK_MAX = 3;
+// 提醒时间的合法形状: 0-23 时 + 两位 0-59 分。设置页与 reminderDue 用同一条(审稿轮抓出: 两处不一致会静默失效)
+const REMINDER_TIME_RE = /^([01]?\d|2[0-3]):[0-5]\d$/;
+const REMINDER_LINES = [
+  "今天还什么都没记呢~ 要不要现在记一段? 想到什么直接发我 ✍️",
+  "我在这儿等你呢~ 今天有什么想记的吗? 一句话也行 📖",
+  "今天过得怎么样? 随手记一段吧, 发出去就记下了 ✍️",
+  "还没听到你今天的消息~ 记点什么再睡吧, 我帮你收着 🌙",
+];
+function reminderText(idx) {
+  const n = REMINDER_LINES.length;
+  return REMINDER_LINES[((idx % n) + n) % n];
+}
+// 该不该发提醒(纯函数, 表驱动可测)。规则一句话: 到点了、今天(逻辑日)还什么都没记、
+// 今天没提醒过、连续没写不满 3 天 → 发。时间比较在"逻辑日时钟"上做(21:30 的窗口一直开到凌晨 4 点)。
+function reminderDue(ctx) {
+  if (!ctx || !ctx.enabled) return false;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(ctx.timeStr || "").trim());
+  if (!m) return false;
+  const rh = Number(m[1]), rm = Number(m[2]);
+  if (rh > 23 || rm > 59) return false; // 设置页同规则拦截(REMINDER_TIME_RE), 这里是纵深防御
+  const [hh, mm] = hhmmStr(ctx.now).split(":").map(Number);
+  const dayStart = _dayStartHour * 60;
+  const nowLogical = (hh * 60 + mm - dayStart + 1440) % 1440;
+  const remLogical = (rh * 60 + rm - dayStart + 1440) % 1440;
+  if (nowLogical < remLogical) return false;
+  if ((ctx.countToday || 0) > 0) return false;
+  if (ctx.remindedDate && ctx.remindedDate === logicalTodayStr(ctx.now)) return false;
+  if ((ctx.streak || 0) >= REMINDER_STREAK_MAX) return false;
+  return true;
 }
 
 // 收尾语分时段(2026-08-16 谷雨审定): 备忘录用户中午也会「结束」, 白天说"晚安"违和。
@@ -2545,7 +2603,13 @@ const GRACE_EXPIRED_NOTICE = "(昨天的已自动收尾, 翻开新的一页 📖
 // 撤回回执带被撤内容预览: 用户要能确认撤对了。纯字符串, 不需要 AI。
 function undoOkReply(removed) {
   if (!removed) return "好的, 帮你撤回啦";
-  if (removed.startsWith("![[")) return "好的, 撤掉了刚才那张图片";
+  if (removed.startsWith("🎤 ![[")) return "好的, 撤掉了刚才那条语音";
+  if (removed.startsWith("![[")) {
+    const low = removed.toLowerCase();
+    if (/\.(mp4|mov|m4v|avi|mkv|webm)\]\]$/.test(low)) return "好的, 撤掉了刚才那个视频";
+    if (/\.(jpg|jpeg|png|gif|webp|bmp|heic|avif)\]\]$/.test(low)) return "好的, 撤掉了刚才那张图片";
+    return "好的, 撤掉了刚才那个文件";
+  }
   const t = removed.replace(/^🎤 /, "").replace(/\n+/g, " ").trim();
   const arr = [...t];
   return "好的, 撤掉了「" + arr.slice(0, 12).join("") + (arr.length > 12 ? "…" : "") + "」";
@@ -3165,6 +3229,69 @@ class DiaryWriter {
     return normalizePath(folder + "/attachments/" + dateStr.slice(0, 4) + "/" + name);
   }
 
+  // 带原名的附件路径(文件/视频/语音兜底用): 日记/attachments/2026/2026-08-19-2130-检查报告.pdf。
+  // 原名保留(病历 PDF 靠名字找), 但要洗掉 wikilink/路径的毒字符; 超长截断保扩展名。
+  attachmentPathNamed(dateStr, origName) {
+    const folder = normalizePath(this.plugin.settings.diaryFolder || "日记");
+    let name = String(origName || "").split(/[/\\]/).pop() || "";
+    name = name.replace(/[\u0000-\u001f:*?"<>|#^\[\]]/g, "").trim();
+    if (!name || /^\.+$/.test(name)) name = "file.bin";
+    // 拆扩展名: 最后一个点(点在开头的「.pdf」残名让它整体当 base——拼上前缀后照样以 .pdf 结尾)
+    const dot = name.lastIndexOf(".");
+    let base, ext;
+    if (dot > 0 && dot < [...name].length - 1) { base = name.slice(0, dot); ext = name.slice(dot); }
+    else { base = name.replace(/\.+$/, "") || name; ext = ""; }
+    // 扩展名超长(>12 字节)不是真扩展名, 并回 base; 整名控制在 ~160 字节内,
+    // 给前缀+撞名重试后缀留余量, 免得撞文件系统 255 字节上限(审稿轮抓出)
+    if (Buffer.byteLength(ext, "utf8") > 12) { base = (base + ext).split(".").join("-"); ext = ""; }
+    let baseArr = [...base];
+    if (baseArr.length > 40) base = baseArr.slice(0, 40).join("");
+    while (Buffer.byteLength(base + ext, "utf8") > 160 && [...base].length > 1) {
+      base = [...base].slice(0, Math.max(1, [...base].length - 8)).join("");
+    }
+    name = dateStr + "-" + hhmmStr().replace(":", "") + "-" + base + ext;
+    return normalizePath(folder + "/attachments/" + dateStr.slice(0, 4) + "/" + name);
+  }
+
+  // 存一个二进制附件 + 在当天笔记里插一个 wikilink 块(marker 是块前缀, 语音兜底用 "🎤")。
+  // 返回 { n, sealed, diskFull, path }; n===0 表示没写成。永不抛。
+  async writeAttachment(buf, path, dateStr, marker) {
+    const day = dateStr || logicalTodayStr();
+    const vault = this.plugin.app.vault;
+    try {
+      await this._ensureParents(path);
+      // 同分钟同名撞车(极小概率): 加随机尾巴重试几次
+      for (let i = 0; i < 5 && vault.getAbstractFileByPath(path); i++) {
+        path = path.replace(/(\.[^./]*)?$/, (m) => "-" + randHex(4) + (m || ""));
+      }
+      await vault.createBinary(path, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    } catch (e) {
+      console.error("[wechat-diary] 存附件失败:", e);
+      return { n: 0, diskFull: String(e && e.message).includes("ENOSPC"), path: "" };
+    }
+    try {
+      const block = (marker ? marker + " " : "") + "![[" + path + "]]";
+      const finalContent = await this._appendBlock(day, hhmmStr(), block);
+      return { n: countMessages(finalContent), sealed: finalContent.includes(CLOSING_MARKER), diskFull: false, path };
+    } catch (e) {
+      console.error("[wechat-diary] 附件插入日记失败:", e);
+      // 附件已落盘只是没插进笔记——不删文件, 留给用户手动捞
+      return { n: 0, diskFull: String(e && e.message).includes("ENOSPC"), path };
+    }
+  }
+
+  // 只插一个指向已有文件的 wikilink 块(重复文件 md5 命中时复用, 绕 #193 解密坑)
+  async appendLinkBlock(path, dateStr) {
+    const day = dateStr || logicalTodayStr();
+    try {
+      const finalContent = await this._appendBlock(day, hhmmStr(), "![[" + path + "]]");
+      return { n: countMessages(finalContent), sealed: finalContent.includes(CLOSING_MARKER) };
+    } catch (e) {
+      console.error("[wechat-diary] 引用附件失败:", e);
+      return { n: 0, sealed: false };
+    }
+  }
+
   async _ensureParents(path) {
     const vault = this.plugin.app.vault;
     const parts = path.split("/").slice(0, -1);
@@ -3424,6 +3551,24 @@ function sniffImageExt(buf) {
   return null;
 }
 
+// 音频格式嗅探(语音兜底用): 微信语音大概率 SILK v3, 认不出按 encode_type 兜底
+// (voice_item.encode_type: 1=pcm..6=silk, 7=mp3, 8=ogg-speex, 对齐官方 types.ts)
+function sniffAudioExt(buf, encodeType) {
+  if (buf && buf.length > 12) {
+    const head = buf.toString("ascii", 0, 10);
+    if (head.includes("#!SILK")) return "silk";
+    if (head.startsWith("#!AMR")) return "amr";
+    if (head.startsWith("OggS")) return "ogg";
+    if (head.startsWith("ID3") || (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0)) return "mp3";
+    if (head.startsWith("RIFF") && buf.toString("ascii", 8, 12) === "WAVE") return "wav";
+  }
+  return { 6: "silk", 7: "mp3", 8: "ogg" }[encodeType] || "bin";
+}
+
+function md5Hex(buf) {
+  return getCrypto().createHash("md5").update(buf).digest("hex").toLowerCase();
+}
+
 // ── iLink 协议客户端(对齐官方 openclaw-weixin 2.4.6; Node https 直连)────
 
 function respCode(o) {
@@ -3618,24 +3763,30 @@ class ILinkClient {
   }
 
   // 收图: 取 URL → 下载 → AES-128-ECB 解密。返回明文 Buffer, 失败抛错。
-  async downloadImage(img) {
-    const media = (img && img.media) || null;
+  // 通用媒体下载: image_item / voice_item / file_item / video_item 结构同为 {media, aeskey?}。
+  // 图片有明文投递路径(无 key 直接返回原文); 文件/语音/视频没有——requireKey 时缺 key 直接失败,
+  // 免得把密文当内容写进库(对齐官方 media-download.ts 的硬性要求)。
+  async downloadMedia(item, requireKey) {
+    const media = (item && item.media) || null;
     // 官方优先用服务端下发的 full_url; 没有才客户端拼(ENABLE_CDN_URL_FALLBACK)
     let url = String((media && media.full_url) || "").trim();
     if (!url && media && media.encrypt_query_param) {
       url = CDN_BASE_URL + "/download?encrypted_query_param=" + encodeURIComponent(media.encrypt_query_param);
     }
-    if (!url) throw new Error("图片没有下载地址");
+    if (!url) throw new Error("没有下载地址");
+    const key = parseImageAesKey(item);
+    if (!key && requireKey) throw new Error("没有解密密钥");
 
     let r;
     for (let hop = 0; ; hop++) {
-      r = await this._rawBinary(url, MEDIA_TIMEOUT_MS, hop);
+      r = await this._rawBinary(url, requireKey ? MEDIA_TIMEOUT_LONG_MS : MEDIA_TIMEOUT_MS, hop);
       if (!r.__redirect) break;
       url = r.__redirect;
     }
-    const key = parseImageAesKey(img);
     return key ? decryptAesEcb(r.__buf, key) : r.__buf;
   }
+
+  async downloadImage(img) { return this.downloadMedia(img, false); }
 
   // 上下线通知: 失败只记日志, 不阻塞(同官方)
   notify(which) {
@@ -3679,10 +3830,18 @@ class DiaryAgent {
     return r && r.status === "sealed" ? { expiredNotice: GRACE_EXPIRED_NOTICE } : {};
   }
 
+  // 写成功后的公共记账: 夜间收尾提示的依据 + 每日提醒的"没写"计数清零。
+  // _writeGen 是单调写入代数: 提醒发送在途时若有新写入, 发完不能把 streak 反手写回(审稿轮抓出的竞态)
+  _noteWrite(n, sealed) {
+    this._lastWrite = { n, sealed: !!sealed };
+    this.session.reminder_streak = 0;
+    this.plugin._writeGen = (this.plugin._writeGen || 0) + 1;
+  }
+
   async _writeEntry(text, isVoice, dateStr) {
     this.session.last_activity_ts = Date.now();
     const res = await this.writer.write(text, isVoice, dateStr);
-    if (res.n) this._lastWrite = { n: res.n, sealed: !!res.sealed }; // 夜间收尾提示的依据
+    if (res.n) this._noteWrite(res.n, res.sealed);
     return res.reply;
   }
 
@@ -3708,24 +3867,127 @@ class DiaryAgent {
       }
     }
     if (!ok) return diskFull ? IMAGE_DISK_FULL_REPLY : IMAGE_FAIL_REPLY;
-    this._lastWrite = { n: lastN, sealed: lastSealed };
+    this._noteWrite(lastN, lastSealed);
     let reply = imageWrittenReply(lastN);
     if (lastN === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
     if (failed) reply = IMAGE_PARTIAL_TEMPLATE.split("{n}").join(String(failed)) + "\n\n" + reply;
     return reply;
   }
 
-  // 纯图片消息(微信发图就是单独一条, 不带文字)。单模式: 图永远照收, 不进文本状态机。
-  async _handleImageOnly(images, cross) {
+  // 语音兜底: 转写失败但有原音频 → 下载存附件("什么都别丢", D10)。返回回执, 永不抛。
+  async _writeVoiceFallback(v, dateStr) {
+    this.session.last_activity_ts = Date.now();
+    const client = this.plugin._client;
+    if (!client) return VOICE_FALLBACK_FAIL_REPLY;
+    try {
+      const buf = await client.downloadMedia(v, true);
+      const ext = sniffAudioExt(buf, v.encode_type);
+      const day = dateStr || logicalTodayStr();
+      const path = this.writer.attachmentPathNamed(day, "语音." + ext);
+      const res = await this.writer.writeAttachment(buf, path, day, "🎤");
+      if (!res.n) return res.diskFull ? ATTACH_DISK_FULL_REPLY : VOICE_FALLBACK_FAIL_REPLY;
+      this._noteWrite(res.n, res.sealed);
+      return this._decorateFirst(voiceFallbackReply(res.n), res.n);
+    } catch (e) {
+      console.error("[wechat-diary] 语音兜底失败:", e && e.message);
+      return VOICE_FALLBACK_FAIL_REPLY;
+    }
+  }
+
+  // 文件/视频接收(D10)。md5 双重用途: ①解密校验(解出来对不上=密钥错了, 别把密文写进库);
+  // ②重复文件复用——微信 CDN 对重复内容复用旧密文却下发新随机 key, 重发同一文件必解密失败(#193),
+  // 靠"md5 见过 → 直接引用本地那份"绕过。返回回执, 永不抛。
+  async _writeFileItem(fi, isVideo, dateStr) {
+    this.session.last_activity_ts = Date.now();
+    const client = this.plugin._client;
+    if (!client) return isVideo ? VIDEO_FAIL_REPLY : FILE_FAIL_REPLY;
+    const day = dateStr || logicalTodayStr();
+    const md5 = String((isVideo ? fi.video_md5 : fi.md5) || "").toLowerCase();
+    const declaredLen = Number((isVideo ? fi.video_size : fi.len) || 0);
+    if (declaredLen > MAX_MEDIA_BYTES) return isVideo ? VIDEO_TOO_BIG_REPLY : FILE_TOO_BIG_REPLY;
+
+    // md5 命中且文件还在 → 不下载, 直接引用
+    const known = md5 ? this._findKnownMd5(md5) : null;
+    if (known) {
+      const r = await this.writer.appendLinkBlock(known, day);
+      if (r.n) { this._noteWrite(r.n, r.sealed); return this._decorateFirst(isVideo ? videoReusedReply(r.n) : fileReusedReply(r.n), r.n); }
+      return isVideo ? VIDEO_FAIL_REPLY : FILE_FAIL_REPLY;
+    }
+
+    let buf;
+    try {
+      buf = await client.downloadMedia(fi, true);
+    } catch (e) {
+      console.error("[wechat-diary] 下载" + (isVideo ? "视频" : "文件") + "失败:", e && e.message);
+      return isVideo ? VIDEO_FAIL_REPLY : FILE_FAIL_REPLY;
+    }
+    // 解密校验: 服务端给了明文 md5 就核对; 对不上=拿到的 key 解不开这份密文(大概率 #193)
+    if (md5 && md5Hex(buf) !== md5) {
+      console.error("[wechat-diary] " + (isVideo ? "视频" : "文件") + " md5 不符, 疑似重复文件解密坑(#193)");
+      return isVideo ? VIDEO_DUP_KEY_REPLY : FILE_DUP_KEY_REPLY;
+    }
+    const origName = isVideo ? "视频.mp4" : (fi.file_name || "file.bin");
+    const path = this.writer.attachmentPathNamed(day, origName);
+    const res = await this.writer.writeAttachment(buf, path, day, "");
+    if (!res.n) return res.diskFull ? ATTACH_DISK_FULL_REPLY : (isVideo ? VIDEO_FAIL_REPLY : FILE_FAIL_REPLY);
+    this._noteWrite(res.n, res.sealed);
+    if (md5) this._rememberMd5(md5, res.path);
+    const reply = isVideo ? videoWrittenReply(res.n) : fileWrittenReply((fi.file_name || "文件").replace(/[「」]/g, ""), res.n);
+    return this._decorateFirst(reply, res.n);
+  }
+
+  _decorateFirst(reply, n) {
+    return n === 1 ? FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS : reply;
+  }
+
+  _findKnownMd5(md5) {
+    const il = this.plugin.data.ilink;
+    const list = Array.isArray(il.fileMd5s) ? il.fileMd5s : [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i] && list[i].md5 === md5) {
+        if (this.plugin.app.vault.getAbstractFileByPath(list[i].path)) return list[i].path;
+        list.splice(i, 1); // 文件被用户删了: 条目作废
+      }
+    }
+    return null;
+  }
+
+  _rememberMd5(md5, path) {
+    const il = this.plugin.data.ilink;
+    if (!Array.isArray(il.fileMd5s)) il.fileMd5s = [];
+    il.fileMd5s.push({ md5, path });
+    if (il.fileMd5s.length > 200) il.fileMd5s.splice(0, il.fileMd5s.length - 200);
+  }
+
+  // 处理一批非图片媒体(语音兜底/文件/视频), 逐个独立, 一个失败不连累其余
+  async _writeOthers(extras, dateStr) {
+    if (!extras) return null;
+    const parts = [];
+    for (const v of extras.voices || []) parts.push(await this._writeVoiceFallback(v, dateStr));
+    for (const f of extras.files || []) parts.push(await this._writeFileItem(f, false, dateStr));
+    for (const f of extras.videos || []) parts.push(await this._writeFileItem(f, true, dateStr));
+    return parts.filter(Boolean).join("\n\n") || null;
+  }
+
+  async _writeAllMedia(images, extras, dateStr) {
+    const parts = [];
+    if (images && images.length) parts.push(await this._writeImages(images, dateStr));
+    const others = await this._writeOthers(extras, dateStr);
+    if (others) parts.push(others);
+    return parts.filter(Boolean).join("\n\n") || null;
+  }
+
+  // 纯媒体消息(不带文字)。单模式: 媒体永远照收, 不进文本状态机。
+  async _handleMediaOnly(images, extras, cross) {
     const profile = this.profile;
     if (profile.state === "unknown" || !profile.state) {
-      // 头一句就发图: 图先收下(内容优先), 再自我介绍
+      // 头一句就发图/文件: 先收下(内容优先), 再自我介绍
       profile.state = "awaiting_name";
-      const imgReply = await this._writeImages(images);
+      const mediaReply = await this._writeAllMedia(images, extras);
       // 开页 tips(撤回/帮助)与欢迎语正文重复, 只留欢迎语里那句
-      return imgReply.replace(FIRST_OF_DAY_TIPS, "") + "\n\n" + this._welcome();
+      return (mediaReply ? mediaReply.replace(FIRST_OF_DAY_TIPS, "") + "\n\n" : "") + this._welcome();
     }
-    return this._writeImages(images);
+    return this._writeAllMedia(images, extras);
   }
 
   // 主业务路由(v0.3.0 单模式: 发什么记什么, 命令词是唯一例外; 闲聊分支整体退役)
@@ -3746,8 +4008,12 @@ class DiaryAgent {
     if (det.intent === INTENT.FINALIZE) {
       // 封存降级为可选仪式: 写收尾标记, 不再切换任何模式; 之后继续发照样记
       const r = await this.writer.finalizeDay();
-      // 用户说过收尾词(哪怕空日子)就记一笔: 说明会用了, 夜间收尾提示见到它永久闭嘴
-      if (r.status !== "error") this.profile.finalize_count = (this.profile.finalize_count || 0) + 1;
+      // 用户说过收尾词(哪怕空日子)就记一笔: 说明会用了, 夜间收尾提示见到它永久闭嘴。
+      // 同时压掉今天的每日提醒——刚道过晚安, 21:30 再催"今天还没记"就荒唐了(审稿轮抓出)
+      if (r.status !== "error") {
+        this.profile.finalize_count = (this.profile.finalize_count || 0) + 1;
+        this.session.reminded_date = logicalTodayStr();
+      }
       // 告别语(晚安/我睡了/今天就到这/明天见)回以同类; 「结束」保留仪式池
       if (det.signoff) return signoffReply(det, r, this.profile.name || null);
       if (r.status === "error") return FINALIZE_FAIL_REPLY;
@@ -3789,25 +4055,27 @@ class DiaryAgent {
 
   // 首次见面 + 取名"一轮即过"(v0.3.0)。取名永不吞内容:
   // 认得出名字才当名字, 认不出=它是内容, 照记 + 提示称呼可后设; 只问这一轮, 不当拦路虎。
-  async _dispatch(text, isVoice, images) {
+  async _dispatch(text, isVoice, images, extras) {
     const now = new Date();
     const cross = await this._loadOrReset();
     const profile = this.profile;
     const hasText = !!(text || "").trim();
+    const extrasCount = extras ? ((extras.voices || []).length + (extras.files || []).length + (extras.videos || []).length) : 0;
+    const hasMedia = images.length > 0 || extrasCount > 0;
     const wasActive = profile.state === "active"; // 首次见面/取名轮不挂夜间提示(欢迎语已经够长)
     const det = hasText ? detectIntent(text) : { intent: INTENT.DIARY };
     this._lastWrite = null; // 本轮有没有写成功、写完是否已封存——夜间收尾提示的依据
     this._pendingNudge = null; // 本轮回执带了夜间提示, 等发送成功后由 commitNudge 落账
 
     let reply;
-    // 「晚安」+图片同条: 图先落库再收尾, 否则图掉在封存线下面、回执"3 段都收好了"紧接"第 4 段"自相矛盾
+    // 「晚安」+媒体同条: 媒体先落库再收尾, 否则附件掉在封存线下面、回执"3 段都收好了"紧接"第 4 段"自相矛盾
     let imgFirstReply = null;
-    if (hasText && images.length && det.intent === INTENT.FINALIZE && profile.state === "active") {
-      imgFirstReply = await this._writeImages(images);
-      images = [];
+    if (hasText && hasMedia && det.intent === INTENT.FINALIZE && profile.state !== "unknown" && profile.state) {
+      imgFirstReply = await this._writeAllMedia(images, extras);
+      images = []; extras = null;
     }
-    if (!hasText && images.length) {
-      reply = await this._handleImageOnly(images, cross);
+    if (!hasText && hasMedia) {
+      reply = await this._handleMediaOnly(images, extras, cross);
     } else if (profile.state === "unknown" || !profile.state) {
       profile.state = "awaiting_name";
       if (det.intent === INTENT.DIARY) {
@@ -3842,11 +4110,11 @@ class DiaryAgent {
       reply = await this._handle(text, isVoice, cross, det);
     }
 
-    // 图文同条: 微信通常拆成两条发, 但协议允许一条里既有 text 又有 image。
-    // 文字先按原路走完(可能是命令), 图永远照收。
-    if (hasText && images.length) {
-      const imgReply = await this._writeImages(images);
-      reply = reply ? reply + "\n\n" + imgReply : imgReply;
+    // 图文同条: 微信通常拆成两条发, 但协议允许一条里既有 text 又有媒体。
+    // 文字先按原路走完(可能是命令), 媒体永远照收。
+    if (hasText && (images.length || extras)) {
+      const mediaReply = await this._writeAllMedia(images, extras);
+      if (mediaReply) reply = reply ? reply + "\n\n" + mediaReply : mediaReply;
     }
     if (imgFirstReply) reply = reply ? imgFirstReply + "\n\n" + reply : imgFirstReply;
 
@@ -3874,10 +4142,10 @@ class DiaryAgent {
   }
 
   // 入口: 白名单兜底 → 路由 → 离线提示一次性附注
-  async onMessage(fromUserId, text, isVoice, images) {
+  async onMessage(fromUserId, text, isVoice, images, extras) {
     // 陌生人静默丢弃(_handleIncoming 已挡, 这里兜底): 回复等于向未授权者确认 bot 存活
     if (fromUserId !== this.plugin.data.ilink.userId) return null;
-    let reply = await this._dispatch(text, isVoice, images || []);
+    let reply = await this._dispatch(text, isVoice, images || [], extras || null);
     if (reply && this.offlineNotice) {
       reply = reply + "\n\n" + this.offlineNotice;
       this.offlineNotice = null;
@@ -4222,6 +4490,33 @@ class WechatDiarySettingTab extends PluginSettingTab {
         }));
     }
 
+    new Setting(containerEl).setName("提醒").setHeading();
+    new Setting(containerEl)
+      .setName("每日提醒")
+      .setDesc("到点时如果今天还什么都没记, 在微信上提醒你一次。只在这台电脑开着 Obsidian 时发得出; 连续 3 天没记就先不打扰, 等你回来再继续。")
+      .addToggle((t) => t.setValue(plugin.settings.reminderEnabled !== false)
+        .onChange(async (v) => { plugin.settings.reminderEnabled = v; await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("提醒时间")
+      .setDesc("24 小时制, 如 21:30。凌晨 4 点前都算前一天, 所以提醒最晚可设到 03:59")
+      .addText((t) => {
+        let lastValid = plugin.settings.reminderTime || "21:30";
+        t.setPlaceholder("21:30").setValue(lastValid)
+          .onChange(async (v) => {
+            const val = (v || "").trim();
+            if (REMINDER_TIME_RE.test(val)) {
+              lastValid = val;
+              plugin.settings.reminderTime = val;
+              await plugin.persist();
+            } else if (/^\d{1,2}:\d{2}$/.test(val)) {
+              // 形状完整但越界(25:00/21:75): 提示并回退, 不能静默落盘让提醒永久哑掉
+              new Notice("提醒时间超出范围, 仍是 " + lastValid);
+              t.setValue(lastValid);
+            }
+            // 打到一半的中间态("21:"): 什么都不做, 存储保持上一个合法值
+          });
+      });
+
     new Setting(containerEl).setName("AI (暂未启用)").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
@@ -4260,11 +4555,17 @@ const DEFAULT_DATA = () => ({
     botId: "", userId: "", baseUrl: "", buf: "",
     contextTokens: {}, recentSeqs: [], pauseUntil: 0, lastAliveTs: 0, loginTime: "",
     botTokenFallback: "", skipBacklog: false,
+    fileMd5s: [], // 已收文件 {md5, path}, 最多 200 条——重复文件直接引用(绕 #193 解密坑)
   },
   // finalize_count: 手动收尾(结束/晚安)过几次; nudge_count: 夜间收尾提示说过几次(终身)——都是"这个人的习惯", 跟 profile 走
   profile: { state: "unknown", name: null, finalize_count: 0, nudge_count: 0 },
   // nudged_date: 夜间收尾提示今天说过没有(逻辑日)
-  session: { mode: "chat", entered_date: "", chat_count_today: 0, last_activity_ts: 0, cost_reminder_shown_date: "", nudged_date: "" },
+  session: {
+    mode: "chat", entered_date: "", chat_count_today: 0, last_activity_ts: 0, cost_reminder_shown_date: "", nudged_date: "",
+    // 每日提醒(D10): reminded_date=今天试过了(逻辑日, 一天只试一次); reminder_streak=连发几次提醒都没等来内容
+    // (写入即清零, ≥3 闭嘴等人回来); reminder_idx=文案轮换指针; reminder_last_result=最近一次发送结果(诊断用)
+    reminded_date: "", reminder_streak: 0, reminder_idx: 0, reminder_last_result: "",
+  },
 });
 
 class WechatDiaryPlugin extends Plugin {
@@ -4337,6 +4638,12 @@ class WechatDiaryPlugin extends Plugin {
     this.registerInterval(window.setInterval(() => {
       if (this._running) this.persist();
     }, 5 * 60 * 1000));
+
+    // 每日提醒(D10): 每分钟查一次该不该提醒。到点时 Obsidian 没开也没关系——
+    // 之后打开, 只要还在同一个逻辑日、今天还没记, 这里就会补发。
+    this.registerInterval(window.setInterval(() => {
+      this._reminderTick().catch((e) => console.error("[wechat-diary] 提醒检查失败:", e));
+    }, 60 * 1000));
 
     // 有 token 就起管道 —— 缺 userId 时进"待认领"模式(只推游标不落笔, 见 _handleIncoming),
     // 让用户发一条消息就能把自己认回来, 而不是卡在未绑定界面无路可走。
@@ -4505,6 +4812,7 @@ class WechatDiaryPlugin extends Plugin {
 
   startPipeline() {
     if (this._running) return;
+    this._pollSettledTs = 0; // 新管道必须先完成一轮拉取, 提醒才可信(重扫码换管道时旧值不能沿用)
     try {
       this._client = new ILinkClient();
     } catch (e) {
@@ -4542,6 +4850,42 @@ class WechatDiaryPlugin extends Plugin {
   _isPaused() {
     const p = this.data.ilink.pauseUntil;
     return Boolean(p && Date.now() < p);
+  }
+
+  // 每日提醒(D10)。发送前提: 管道活着且最近一轮拉取已完成(_pollSettledTs 新鲜)——
+  // 电脑刚唤醒时今天的消息可能还没补收进来, 这时 countDay()=0 是假象, 不能催人。
+  // 一天只试一次(先记账再发, 网络错也不重试, 防"发成功但响应丢了"的双发); 结果记在
+  // session.reminder_last_result 里攒数据——提醒到底发不发得出去, 019 时代没人知道, 现在按返回码见分晓。
+  async _reminderTick() {
+    if (!this._running || !this._client || this._skipBacklog || this._isPaused()) return;
+    const il = this.data.ilink;
+    if (!il.userId) return;
+    if (!this._pollSettledTs || Date.now() - this._pollSettledTs > 3 * 60 * 1000) return;
+    const s = this.data.session;
+    const now = new Date();
+    const ctx = {
+      enabled: this.settings.reminderEnabled, timeStr: this.settings.reminderTime || "21:30",
+      now, countToday: 0, remindedDate: s.reminded_date, streak: s.reminder_streak,
+    };
+    // 先用 countToday=0 预判: 其余条件不满足就不必读文件(每分钟 tick, 关着提醒也读一遍太浪费)
+    if (!reminderDue(ctx)) return;
+    ctx.countToday = await this.writer.countDay();
+    if (!reminderDue(ctx)) return;
+    s.reminded_date = logicalTodayStr(now);
+    const text = reminderText(s.reminder_idx || 0);
+    s.reminder_idx = ((s.reminder_idx || 0) + 1) % REMINDER_LINES.length;
+    await this.persist();
+    const genBefore = this._writeGen || 0; // 发送在途时的新写入不该被 streak++ 覆盖
+    try {
+      await this._client.sendText(il.userId, text, il.contextTokens[il.userId]);
+      if ((this._writeGen || 0) === genBefore) s.reminder_streak = (s.reminder_streak || 0) + 1;
+      s.reminder_last_result = "ok " + new Date().toISOString();
+    } catch (e) {
+      s.reminder_last_result = "fail " + ((e && (e.ilinkCode || e.message)) || "?") + " " + new Date().toISOString();
+      if (e && e.ilinkCode === STALE_TOKEN_ERRCODE) il.pauseUntil = Date.now() + SESSION_PAUSE_MS;
+      console.error("[wechat-diary] 提醒发送失败:", e && e.message);
+    }
+    await this.persist();
   }
 
   stopPipeline() {
@@ -4611,7 +4955,7 @@ class WechatDiaryPlugin extends Plugin {
       // 服务端到底会不会返回一个 msgs 为空的响应是未知的(协议笔记 P0 第 1 条),
       // 只认"空 msgs"的话, 一旦它选择 hold 到超时, _skipBacklog 就永远解不掉,
       // 插件会安静地再也不写日记 —— 比重复写还糟。
-      if (r.__timeout) { await this._clearSkipBacklog(); continue; }
+      if (r.__timeout) { this._pollSettledTs = Date.now(); await this._clearSkipBacklog(); continue; }
 
       const code = respCode(r.json);
       if (code === STALE_TOKEN_ERRCODE) {
@@ -4629,6 +4973,7 @@ class WechatDiaryPlugin extends Plugin {
       this._failCount = 0;
       if (this._noticedDown) { this._noticedDown = false; this._setStatus("已连接"); }
       il.lastAliveTs = Date.now();
+      this._pollSettledTs = Date.now(); // 一轮拉取完成: 今天的积压已进来, 提醒的 countDay 才可信
 
       if (typeof r.json.longpolling_timeout_ms === "number" && r.json.longpolling_timeout_ms > 0) {
         pollTimeout = r.json.longpolling_timeout_ms;
@@ -4687,16 +5032,23 @@ class WechatDiaryPlugin extends Plugin {
     let text = "";
     let hasText = false;
     let hasVoice = false;
-    const images = [];
+    const images = [], voices = [], files = [], videos = [];
     for (const item of msg.item_list || []) {
       if (item.type === 1 && item.text_item) { text += item.text_item.text || ""; hasText = true; }
-      else if (item.type === 3 && item.voice_item) { text += item.voice_item.text || ""; hasVoice = true; }
+      else if (item.type === 3 && item.voice_item) {
+        hasVoice = true;
+        const vt = item.voice_item.text || "";
+        if (vt) text += vt;
+        else if (item.voice_item.media) voices.push(item.voice_item); // 转写失败: 存原音频兜底(D10)
+      }
       else if (item.type === 2 && item.image_item) { images.push(item.image_item); }
+      else if (item.type === 4 && item.file_item) { files.push(item.file_item); }   // D10: 文件照收
+      else if (item.type === 5 && item.video_item) { videos.push(item.video_item); } // D10: 视频照收
     }
-    if (!hasText && !hasVoice && !images.length) return; // 文件/视频等, 日记场景仍忽略
+    if (!hasText && !hasVoice && !images.length && !files.length && !videos.length) return; // 未知类型仍忽略
     const isVoice = hasVoice && !hasText;
 
-    const reply = await this.agent.onMessage(from, text, isVoice, images);
+    const reply = await this.agent.onMessage(from, text, isVoice, images, { voices, files, videos });
     if (reply && from) {
       // 冷却期不出站(官方 assertSessionActive 语义): 日记已写入, 只是确认回执发不出
       if (this._isPaused() || !this._client) return;
@@ -4724,6 +5076,9 @@ WechatDiaryPlugin.__internals = {
   INTENT, texts: { HELP_TEXT, NIGHT_SIGNOFF_TIP, FIRST_OF_DAY_PREFIX, FIRST_OF_DAY_TIPS, FIRST_OF_DAY_TIPS_NIGHT, FINALIZE_EMPTY_REPLY, FINALIZE_FAIL_REPLY, GRACE_EXPIRED_NOTICE, CLOSING_MARKER },
   pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow, canMergeIntoLastHeader,
   isUndoPhrase, signoffReply, nightSignoffTip, setNudgeNightHour, isLateNight, DiaryWriter,
+  reminderDue, reminderText, sniffAudioExt, md5Hex,
+  texts2: { REMINDER_LINES, FILE_DUP_KEY_REPLY, FILE_TOO_BIG_REPLY, VOICE_FALLBACK_FAIL_REPLY,
+    VIDEO_DUP_KEY_REPLY, VIDEO_TOO_BIG_REPLY, ATTACH_DISK_FULL_REPLY, REMINDER_TIME_RE },
 };
 
 module.exports = WechatDiaryPlugin;
