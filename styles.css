@@ -32,3 +32,44 @@
   color: var(--text-muted);
   font-size: var(--font-ui-small);
 }
+
+/* ── 语音气泡(D12): 微信样式, 点击即播 ─────────────────────────────── */
+.wd-voice-embed { display: inline-block; max-width: 100%; }
+.wd-voice-bubble {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 64px;
+  max-width: 240px;
+  padding: 7px 12px;
+  border-radius: 6px;
+  background: #95ec69;
+  color: #0b1a08;
+  cursor: pointer;
+  user-select: none;
+  line-height: 1;
+  transition: filter 0.1s;
+}
+.wd-voice-bubble:hover { filter: brightness(0.96); }
+.wd-voice-bubble:active { filter: brightness(0.9); }
+.theme-dark .wd-voice-bubble { background: #3eb575; color: #06170d; }
+.wd-voice-icon { display: inline-flex; align-items: center; }
+.wd-voice-icon svg { display: block; }
+.wd-voice-dur { font-size: 0.85em; font-variant-numeric: tabular-nums; }
+/* 播放中: 三道弧线由内到外循环点亮(微信同款) */
+.wd-voice-bubble .wd-arc { opacity: 1; }
+.wd-voice-bubble.wd-playing .wd-arc1 { animation: wd-arc-blink 1.2s infinite; animation-delay: 0s; }
+.wd-voice-bubble.wd-playing .wd-arc2 { animation: wd-arc-blink 1.2s infinite; animation-delay: 0.25s; }
+.wd-voice-bubble.wd-playing .wd-arc3 { animation: wd-arc-blink 1.2s infinite; animation-delay: 0.5s; }
+@keyframes wd-arc-blink {
+  0%, 15% { opacity: 0.25; }
+  40%, 60% { opacity: 1; }
+  85%, 100% { opacity: 0.25; }
+}
+
+/* 原生播放器交给 CSS 隐藏: Obsidian 的 embed 加载器可能在气泡之后才填充, 与顺序无关 */
+.wd-voice-embed > :not(.wd-voice-bubble) { display: none; }
+.wd-voice-bubble:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--interactive-accent); }
+@media (prefers-reduced-motion: reduce) {
+  .wd-voice-bubble.wd-playing .wd-arc { animation: none; }
+}

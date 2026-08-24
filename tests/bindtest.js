@@ -23,6 +23,8 @@ class Plugin {
   addSettingTab() {}
   addStatusBarItem() { return { setText() {} }; }
   registerInterval() {}
+  registerMarkdownPostProcessor() {}
+  register() {}
 }
 class PluginSettingTab { constructor(app, plugin) { this.app = app; this.plugin = plugin; } }
 class Modal {
@@ -238,23 +240,31 @@ async function newPlugin(secrets, storedData) {
   check("「叫我小明」短句 → 改称呼不落库", p.data.profile.name === "小明" && calls.writes.length === 1, r);
   r = await p.agent._dispatch("叫我妈过来吃饭的时候记得提醒我带上钥匙", false, []);
   check("「叫我」开头的长句是内容 → 照记", calls.writes.length === 2 && p.data.profile.name === "小明", r);
+  r = await p.agent._dispatch("叫我妈过来吃饭", false, []);
+  check("「叫我妈过来吃饭」短句(>4字候选) → 也是内容照记, 称呼不变", calls.writes.length === 3 && p.data.profile.name === "小明", r);
+  r = await p.agent._dispatch("叫我小可爱", false, []);
+  check("「叫我小可爱」(≤4字) → 改称呼", p.data.profile.name === "小可爱" && calls.writes.length === 3, r);
 
-  console.log("\n【14】首次见面: 内容优先, 取名一轮即过");
+  console.log("\n【14】首次见面(D11: 不再问名字): 内容优先, 欢迎语跟上, 第二句照常记");
   p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => { const d = BOUND_DATA(); d.profile = { state: "unknown", name: null }; return d; })());
   calls = stubWriter(p);
   r = await p.agent._dispatch("帮我记一下明天要给妈妈买降压药", false, []);
   check("第一句是内容 → 先记再欢迎", calls.writes.length === 1 && r.includes("随手记 Agent"), r);
+  check("欢迎语不再问名字", !r.includes("叫你什么名字") && !r.includes("跳过"), r);
   r = await p.agent._dispatch("谷雨", false, []);
-  check("第二句像名字 → 取名", p.data.profile.name === "谷雨" && calls.writes.length === 1, r);
+  check("第二句短句 → 照记, 不再被当名字(D11 顺带消掉取名吞内容 bug)", p.data.profile.name === null && calls.writes.length === 2, r);
+  r = await p.agent._dispatch("叫我小谷", false, []);
+  check("「叫我XX」后门仍在", p.data.profile.name === "小谷" && calls.writes.length === 2, r);
 
-  console.log("\n【15】首次见面发「在吗」: 欢迎语即回答; 之后长句不被取名吞掉");
+  console.log("\n【15】首次见面发「在吗」: 欢迎语即回答; 之后长短句全照记");
   p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => { const d = BOUND_DATA(); d.profile = { state: "unknown", name: null }; return d; })());
   calls = stubWriter(p);
   r = await p.agent._dispatch("在吗", false, []);
   check("第一句探活 → 欢迎语, 不落库", calls.writes.length === 0 && r.includes("随手记 Agent"), r);
   r = await p.agent._dispatch("今天跟医生确认了下周复查的时间安排", false, []);
-  check("取名轮里的长句 → 当内容记, 不吞", calls.writes.length === 1 && r.includes("称呼不急"), r);
-  check("取名只问一轮", p.data.profile.state === "active");
+  check("第二句内容 → 照记, 无取名纠缠", calls.writes.length === 1 && !r.includes("称呼"), r);
+  check("state 已 active", p.data.profile.state === "active");
+  check("老 data.json 滞留 awaiting_name → 迁移 active", (await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => { const d = BOUND_DATA(); d.profile = { state: "awaiting_name", name: null }; return d; })())).data.profile.state === "active");
 
   console.log("\n【16】跨天: 宽限期外自动封存昨天, 新内容记到今天");
   p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, (() => {
@@ -762,6 +772,83 @@ async function newPlugin(secrets, storedData) {
   p.writer.writeAttachment = async () => ({ n: 0, sealed: false, diskFull: true, path: "" });
   r = await p.agent._dispatch("", false, [], { voices: [], files: [{ file_name: "f.pdf", md5: fileMd5, len: "10", media: { aes_key: "k" } }], videos: [] });
   check("文件磁盘满 → 「存附件失败」不说图片", r === I.texts2.ATTACH_DISK_FULL_REPLY, r);
+
+
+  console.log("\n【34】D12 语音原声: SILK→WAV、原声+文字同块、命令不存音频、失败降级");
+  const silkLib = I.getSilkLib();
+  check("内嵌 SILK 解码器可用", !!silkLib && typeof silkLib.decode === "function");
+  // pcmToWav 头部
+  const wavHdr = I.pcmToWav(Buffer.alloc(4800), 24000);
+  check("WAV 头: RIFF/WAVE/PCM/mono/24k/16bit", wavHdr.slice(0,4).toString()==="RIFF" && wavHdr.slice(8,12).toString()==="WAVE" && wavHdr.readUInt16LE(20)===1 && wavHdr.readUInt16LE(22)===1 && wavHdr.readUInt32LE(24)===24000 && wavHdr.readUInt16LE(34)===16 && wavHdr.length===44+4800);
+  // 往返: encode → silkToWav
+  const pcmIn = Buffer.alloc(24000*2);
+  for (let i=0;i<24000;i++) pcmIn.writeInt16LE(Math.round(Math.sin(i/24000*440*2*Math.PI)*12000), i*2);
+  const encOut = await silkLib.encode(pcmIn, 24000);
+  const silkBuf = Buffer.from(encOut.data);
+  const wavOut = await I.silkToWav(silkBuf);
+  check("SILK 往返解码成合法 WAV", !!wavOut && wavOut.slice(0,4).toString()==="RIFF" && wavOut.length > 40000, wavOut && String(wavOut.length));
+  check("encode 输出自带 0x02 前缀(微信同款形态), 原样可解", silkBuf[0] === 2 && !!wavOut);
+  const naked = silkBuf[0] === 2 ? silkBuf.slice(1) : silkBuf;
+  const wavOut2 = await I.silkToWav(naked);
+  check("裸 #!SILK(无前缀)自动补 0x02 后可解", !!wavOut2 && wavOut2.length === wavOut.length, wavOut2 && String(wavOut2.length));
+  check("非 SILK(mp3) → null 不硬解", (await I.silkToWav(Buffer.from("ID3xxxxxxxxxxxxxxxxx"))) === null);
+  check("仅魔数的垃圾 SILK → null(解出的 40ms 噪声不算成功, 兜底保原始字节)", (await I.silkToWav(Buffer.from("\x02#!SILK_V3", "binary"))) === null);
+  // writeAttachment + textAfter: 真 DiaryWriter + 假 vault
+  const vFiles = {};
+  const vWp = { app: { vault: {
+    getFileByPath: (x) => (x in vFiles ? { path: x } : null),
+    getAbstractFileByPath: (x) => (x in vFiles ? { path: x } : null),
+    getFolderByPath: () => ({}), createFolder: async () => {},
+    create: async (x, c) => { vFiles[x] = c; },
+    createBinary: async (x, b) => { vFiles[x] = b; },
+    process: async (f, fn) => { vFiles[f.path] = fn(vFiles[f.path]); return vFiles[f.path]; },
+    cachedRead: async (f) => vFiles[f.path],
+  } }, settings: { diaryFolder: "日记" } };
+  const VW = new I.DiaryWriter(vWp, null);
+  const vres = await VW.writeAttachment(wavOut, "日记/attachments/2026/2026-08-20-1030-语音.wav", "2026-08-20", "🎤", "今天试了新的手冲豆子\n\n\n花香很明显");
+  const dayFile = vFiles[VW.diaryPath("2026-08-20")];
+  check("语音块 = 🎤 链接 + 换行 + 清洗后的文字, 计 1 条", vres.n === 1 && dayFile.includes("🎤 ![[日记/attachments/2026/2026-08-20-1030-语音.wav]]\n今天试了新的手冲豆子\n花香很明显"), dayFile);
+  await VW.write("第二条", false, "2026-08-20");
+  let vu = await VW.undoLastBlock("2026-08-20");
+  vu = await VW.undoLastBlock("2026-08-20");
+  check("撤回语音块 = 音频链接+文字整块一起撤", vu.ok && vu.removed.startsWith("🎤 ![[") && vu.removed.includes("手冲豆子") && !vFiles[VW.diaryPath("2026-08-20")].includes("🎤"), JSON.stringify(vu));
+  // agent 全链路: 开关开 → 原声+文字; 命令 → 不存音频; 失败 → 降级纯文字
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  let attachCalls = [];
+  p._client = { downloadMedia: async () => silkBuf };
+  p.writer.attachmentPathNamed = (day, name) => "日记/attachments/x/" + day + "-" + name;
+  p.writer.writeAttachment = async (buf, path, day, marker, textAfter) => {
+    attachCalls.push({ path, marker, textAfter, riff: buf.slice(0,4).toString() });
+    calls.writes.push(marker + "![[" + path + "]]" + (textAfter ? "\n" + textAfter : ""));
+    return { n: calls.writes.length, sealed: false, diskFull: false, path };
+  };
+  const VA = { text: "有转写", media: { aes_key: "k" }, encode_type: 6 };
+  r = await p.agent._dispatch("今天喝了一杯咖啡", true, [], { voices: [], files: [], videos: [], voiceAudio: VA });
+  check("开关开+语音记录 → 原声 wav+文字同块", attachCalls.length === 1 && attachCalls[0].riff === "RIFF" && attachCalls[0].marker === "🎤" && attachCalls[0].textAfter === "今天喝了一杯咖啡" && r.includes("🎤 记下来啦"), JSON.stringify(attachCalls));
+  r = await p.agent._dispatch("结束", true, [], { voices: [], files: [], videos: [], voiceAudio: VA });
+  check("语音说「结束」→ 封存, 不存音频", calls.finalized.length === 1 && attachCalls.length === 1, r);
+  p._client = { downloadMedia: async () => { throw new Error("网络挂了"); } };
+  r = await p.agent._dispatch("降级这条", true, [], { voices: [], files: [], videos: [], voiceAudio: VA });
+  check("下载失败 → 静默降级纯文字, 内容不丢", calls.writes.some((w) => w === "降级这条") && r.includes("记下来啦"), r);
+  r = await p.agent._dispatch("普通语音", true, [], { voices: [], files: [], videos: [], voiceAudio: null });
+  check("开关关(voiceAudio 空) → 现状纯文字", calls.writes.some((w) => w === "普通语音"), r);
+  p._client = { downloadMedia: async () => silkBuf };
+  r = await p.agent._dispatch("打字加语音混合", false, [], { voices: [], files: [], videos: [], voiceAudio: VA });
+  check("文字+语音混合条 → 原声也存(不再看 isVoice)", attachCalls.some((c) => c && c.textAfter === "打字加语音混合"), JSON.stringify(attachCalls));
+  // _handleIncoming 层: 开关决定 voiceAudio 是否收集
+  p = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+  calls = stubWriter(p);
+  attachCalls = [];
+  p.settings.saveVoiceAudio = true;
+  p._client = { downloadMedia: async () => silkBuf, sendText: async () => {} };
+  p.writer.attachmentPathNamed = (day, name) => "x/" + name;
+  p.writer.writeAttachment = async (buf, path, day, marker, textAfter) => { attachCalls.push(textAfter); calls.writes.push(textAfter || path); return { n: calls.writes.length, sealed: false, diskFull: false, path }; };
+  await p._handleIncoming({ from_user_id: "U1", seq: "901", item_list: [{ type: 3, voice_item: { text: "语音转写内容", media: { aes_key: "k" }, encode_type: 6 } }] });
+  check("入站链路: 开关开 → 原声块落库", attachCalls.length === 1 && attachCalls[0] === "语音转写内容", JSON.stringify(attachCalls));
+  p.settings.saveVoiceAudio = false;
+  await p._handleIncoming({ from_user_id: "U1", seq: "902", item_list: [{ type: 3, voice_item: { text: "第二条语音", media: { aes_key: "k" }, encode_type: 6 } }] });
+  check("入站链路: 开关关 → 纯文字(现状)", attachCalls.length === 1 && calls.writes.includes("第二条语音"), JSON.stringify(calls.writes));
 
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
