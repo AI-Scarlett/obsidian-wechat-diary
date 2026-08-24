@@ -465,6 +465,8 @@ NONE=0, TEXT=1, IMAGE=2, VOICE=3, **FILE=4**, **VIDEO=5**, TOOL_CALL_START=11, T
 
 **其他没用上的协议能力**: sendTyping「正在输入」(getconfig 取 typing_ticket, status 1/2 开关); TOOL_CALL 进度气泡; GetUpdatesResp.longpolling_timeout_ms 服务端建议超时(官方动态采纳); 发侧 sendWeixinMediaFile 可把任意文件发回给用户。
 
+**用户资料不可得(2026-08-20 调查, 确证)**: bot 侧**拿不到用户的微信昵称和头像**——扫码确认只回 bot_token/ilink_bot_id/baseurl/ilink_user_id(login-qr.ts:40-49); 消息体 WeixinMessage 15 个字段里关于发送者只有 from_user_id(types.ts:180-196); 全部 9 个端点无任何资料查询接口, 全源码 grep nickname/avatar/profile = 0; 5 份第三方逆向文档交叉一致; 官方仓 244+ issues 无人提过此需求。from_user_id 形态 = `<hex>@im.wechat`(匿名不透明, 类似公众号 openid, 只能读出"是个微信用户")。bot 自己的名字/头像同样协议改不了(本地配置, 无 set-profile 端点)。**产品含义**: 想称呼用户只能让用户自报; 隐私上可作卖点("bot 不知道你是谁, 只有匿名 ID")。
+
 **风险注记**: ⚠️ 服务端能力会悄悄回收的先例——语音气泡曾可用后失效(#209); 入站图片/视频被服务端压缩, 原图字段无效(#241), 影响病历照片 OCR 场景的画质预期。
 
 ## 附：原始实现位置
