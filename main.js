@@ -2556,9 +2556,8 @@ function reminderDue(ctx) {
 // 收尾语分时段(2026-08-16 谷雨审定): 备忘录用户中午也会「结束」, 白天说"晚安"违和。
 // 20 点后到逻辑日边界前用晚安池, 其余用中性池。
 const CLOSING_LINES_DAY = [
-  "已经装订成册 📖",
-  "归档完毕, 这一页属于今天了。",
-  "收进时光胶囊, 下次见。",
+  "归档完毕, 今天的记录都到这里啦~",
+  "文字已经记录好, 下次见~",
   "咔哒, 打卡完成 ✓ 今天辛苦了。",
 ];
 const CLOSING_LINES_NIGHT = [
@@ -2566,11 +2565,11 @@ const CLOSING_LINES_NIGHT = [
   "小册子合上了, 安心睡吧。",
   "好了, 今天的心事都在本子里了。",
   "笔记本盖章 📮 愿今晚好梦。",
-  "今天的字, 都存好了, 晚安。",
+  "今天的文字, 都存好了, 晚安。",
 ];
 const CLOSING_FAREWELL_DAY = ["下次见 👋", "明天见 👋", "明天再见呀 ✨"];
 const CLOSING_FAREWELL_NIGHT = ["好梦, 明天见 🌙", "明天我等你 📖", "明天见 👋"];
-const CLOSING_WITH_NAME_DAY = ["{name}, 这一页属于今天, 收好了 📖"];
+const CLOSING_WITH_NAME_DAY = ["{name}, 今天这些文字都收好了 📖"];
 const CLOSING_WITH_NAME_NIGHT = [
   "辛苦啦{name}~ 今天又记下了一些珍贵的东西 🌙",
   "{name}, 今天的故事我收好啦, 晚安 ✨",
@@ -2584,7 +2583,7 @@ function pingReply(n) {
 }
 
 // 每天第一条的回执前缀: 零动作给足"它在且在记"的信任信号; 完整命令提示每天只在这出现一次
-const FIRST_OF_DAY_PREFIX = "今天第一条, 已开新的一页 📖\n";
+const FIRST_OF_DAY_PREFIX = "今天的第一条记录, 已经记录在新开的文件里啦 📖\n";
 const FIRST_OF_DAY_TIPS = "\n(说错了发「撤回」, 随时发「帮助」看全部用法)";
 // 夜间收尾提示(2026-08-19 谷雨拍板): 把"怎么收尾"教在开头而不是中途打断——当天第一条落在深夜
 // (nudgeNightHour 起)的消息, 回执附一句; 一天一次、终身最多 3 次、用户手动收尾过一次就永久闭嘴。

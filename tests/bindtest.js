@@ -376,7 +376,7 @@ async function newPlugin(secrets, storedData) {
   await p.agent._dispatch("先去检查再说", false, []);
   r = await p.agent._dispatch("晚安", false, []);
   check("有内容「晚安」→ 封存 + 回以同类(带段数)", calls.finalized.length === 2 && /晚安|好梦/.test(r) && r.includes("2 段都收好了"), r);
-  check("不走「结束」仪式池", !r.includes("装订") && !r.includes("小册子") && !r.includes("时光胶囊"));
+  check("不走「结束」仪式池", !r.includes("归档完毕") && !r.includes("小册子") && !r.includes("打卡完成") && !r.includes("下次见~"));
   check("finalize_count = 2", p.data.profile.finalize_count === 2, String(p.data.profile.finalize_count));
   r = await p.agent._dispatch("晚安", false, []);
   check("紧接着再说晚安(没补记)→ 短句只道别", r === "晚安 🌙 明天见", r);
