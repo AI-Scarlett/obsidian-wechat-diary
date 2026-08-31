@@ -4968,9 +4968,9 @@ class ConfirmModal extends Modal {
     this.titleEl.setText(this.t);
     const pEl = this.contentEl.createEl("p", { text: this.text });
     if (pEl && pEl.style) pEl.style.whiteSpace = "pre-wrap";
-    new Setting(this.contentEl)
-      .addButton((b) => b.setButtonText(this.okText).setCta().onClick(async () => { this._done = true; this.close(); await this.onOk(); }))
-      .addButton((b) => b.setButtonText("取消").onClick(() => this.close()));
+    const row = new Setting(this.contentEl)
+      .addButton((b) => b.setButtonText(this.okText).setCta().onClick(async () => { this._done = true; this.close(); await this.onOk(); }));
+    if (!this.hideCancel) row.addButton((b) => b.setButtonText("取消").onClick(() => this.close()));
   }
   onClose() { this.contentEl.empty(); if (!this._done && this.onCancel) this.onCancel(); }
 }
@@ -4989,6 +4989,17 @@ class WechatDiarySettingTab extends PluginSettingTab {
     let content = "";
     try { content = await plugin.app.vault.cachedRead(f); } catch (e) { return; }
     if (!isForeignFile(content)) return;
+    // 文件里有我们的节 = 共用模式自己写的每日笔记, 不是外来文件——不能提供「改回默认」
+    // (谷雨实测: 关开关时点了改回默认, 路径格式被改掉, 之后的文件散在两个层级)
+    const loc = locateSection(content, plugin.writer._heading());
+    if (loc) {
+      const m = new ConfirmModal(this.app, "已关闭「写进已有的每日笔记」",
+        "今天的文件「" + path + "」是共用模式写的每日笔记。关掉后, 微信内容会继续追加到这个文件的末尾(不再归入「" + plugin.writer._heading() + "」一节), 「撤回」「在吗」只认微信记的部分。\n想让内容写回插件自己的文件夹, 改「日记」区的 日记文件夹 / 路径格式。",
+        "知道了", async () => {});
+      m.hideCancel = true;
+      m.open();
+      return;
+    }
     const before = plugin._beforeImport;
     const target = before
       ? { diaryFolder: before.diaryFolder, pathFormat: before.pathFormat }
@@ -5026,19 +5037,42 @@ class WechatDiarySettingTab extends PluginSettingTab {
       "确定", async () => {}, onCancel).open();
   }
 
-  // 从每日笔记设置导入: Periodic Notes(daily) 优先, 否则核心「每日笔记」; 一键覆盖三项, 先确认
+  // 读每日笔记的设置: Periodic Notes(daily) 优先, 否则核心「每日笔记」。返回 { src: {folder,format,template}, name } 或 null
+  _readDailyNotesSettings() {
+    const app = this.app;
+    try {
+      const pn = app.plugins && app.plugins.getPlugin ? app.plugins.getPlugin("periodic-notes") : null;
+      if (pn && pn.settings && pn.settings.daily && pn.settings.daily.enabled !== false) return { src: pn.settings.daily, name: "Periodic Notes" };
+      const dn = app.internalPlugins && app.internalPlugins.getPluginById ? app.internalPlugins.getPluginById("daily-notes") : null;
+      if (dn && dn.enabled && dn.instance && dn.instance.options) return { src: dn.instance.options, name: "每日笔记" };
+    } catch (e) { /* 读不到按没有算 */ }
+    return null;
+  }
+
+  // 打开开关时自动对齐(谷雨 8/31 拍板做法一): 每日笔记的位置/格式与插件设置不一致 → 直接弹导入确认;
+  // 读不到设置 → 提示自己选。不静默改任何值。
+  async _suggestImportOnEnable() {
+    const plugin = this.plugin;
+    const found = this._readDailyNotesSettings();
+    if (!found) {
+      new Notice("没找到每日笔记插件的设置(核心「每日笔记」或 Periodic Notes 都没启用)。请在「日记」区选好你每日笔记的文件夹和路径格式, 否则微信内容会写到「" + (plugin.settings.diaryFolder || "日记") + "」下、和你的每日笔记不在一起", 12000);
+      return;
+    }
+    const dnFolder = String(found.src.folder || "").trim() || "/";
+    const dnFormat = String(found.src.format || "").trim() || "YYYY-MM-DD";
+    const curFolder = String(plugin.settings.diaryFolder || "日记");
+    const curFormat = plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat;
+    const same = normalizePath(dnFolder === "/" ? "/" : dnFolder) === normalizePath(curFolder === "/" ? "/" : curFolder) && dnFormat === curFormat;
+    if (same) return;
+    this._importDailyNotes(); // 已自带差异清单 + 确认框
+  }
+
+  // 从每日笔记设置导入: 一键覆盖三项, 先确认
   _importDailyNotes() {
     const plugin = this.plugin;
     const app = this.app;
-    let src = null, name = "";
-    try {
-      const pn = app.plugins && app.plugins.getPlugin ? app.plugins.getPlugin("periodic-notes") : null;
-      if (pn && pn.settings && pn.settings.daily && pn.settings.daily.enabled !== false) { src = pn.settings.daily; name = "Periodic Notes"; }
-      if (!src) {
-        const dn = app.internalPlugins && app.internalPlugins.getPluginById ? app.internalPlugins.getPluginById("daily-notes") : null;
-        if (dn && dn.enabled && dn.instance && dn.instance.options) { src = dn.instance.options; name = "每日笔记"; }
-      }
-    } catch (e) { src = null; }
+    const found = this._readDailyNotesSettings();
+    const src = found && found.src, name = found && found.name;
     if (!src) { new Notice("没找到启用的每日笔记设置(核心「每日笔记」或 Periodic Notes 的 daily), 请在上面自己选日记文件夹 / 路径格式 / 模板"); return; }
     const folder = String(src.folder || "").trim() || "/";
     const format = String(src.format || "").trim() || "YYYY-MM-DD";
@@ -5287,13 +5321,15 @@ class WechatDiarySettingTab extends PluginSettingTab {
     const headingNow = st.sectionHeading || DEFAULT_SETTINGS.sectionHeading;
     new Setting(containerEl)
       .setName("写进已有的每日笔记")
-      .setDesc("开启后不再单独建文件: 微信内容写进当天每日笔记末尾的「## " + headingNow + "」一节, 撤回和段数只看这一节。关着时一切与以前相同。")
+      .setDesc("开启后不再单独建文件: 微信内容写进当天每日笔记末尾的「## " + headingNow + "」一节, 撤回和段数只看这一节。打开时会读取每日笔记插件的位置并请你确认对齐; 之后你改了每日笔记插件的设置, 这里不会自动跟着变(看下面的预览行)。关着时一切与以前相同。")
       .addToggle((t) => t.setValue(!!st.sharedDailyNote)
         .onChange(async (v) => {
           st.sharedDailyNote = v;
           await plugin.persist();
-          if (v) await this._headingCollisionCheck(async () => { st.sharedDailyNote = false; await plugin.persist(); this.display(); });
-          else await this._foreignCheck();
+          if (v) {
+            await this._suggestImportOnEnable(); // 位置/格式和每日笔记插件不一致 → 弹导入确认(做法一, 8/31)
+            await this._headingCollisionCheck(async () => { st.sharedDailyNote = false; await plugin.persist(); this.display(); });
+          } else await this._foreignCheck();
           this.display();
         }));
     if (st.sharedDailyNote) {
