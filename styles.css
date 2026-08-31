@@ -73,3 +73,7 @@
 @media (prefers-reduced-motion: reduce) {
   .wd-voice-bubble.wd-playing .wd-arc { animation: none; }
 }
+
+/* #15: 设置页路径格式/附件文件夹输入框下方的实时预览行 */
+.wd-path-preview { margin-top: 4px; font-size: var(--font-ui-smaller); color: var(--text-muted); word-break: break-all; }
+.wd-path-preview-bad { color: var(--text-error); }
